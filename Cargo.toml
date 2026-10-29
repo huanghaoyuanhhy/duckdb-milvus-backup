@@ -1,8 +1,17 @@
-[package]
-name = "duckdb-milvus-backup"
+[workspace]
+members = ["crates/core", "crates/native", "crates/wasm"]
+default-members = ["crates/native"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace.dependencies]
+duckdb-neo = { version = "0.20000.0", features = ["build-extension"] }
+duckdb-loadable-macros = { version = "1.20000.0", features = ["neo"] }
+milvus_backup_core = { path = "crates/core" }
 
-[dependencies]
+[profile.release]
+lto = true
+strip = true

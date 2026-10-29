@@ -1,0 +1,13 @@
+[package]
+name = "milvus_backup_wasm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "milvus_backup"
+crate-type = ["staticlib"]
+
+[dependencies]
+duckdb-neo.workspace = true
+duckdb-loadable-macros.workspace = true
+milvus_backup_core.workspace = true

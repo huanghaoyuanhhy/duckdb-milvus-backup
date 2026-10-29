@@ -1,0 +1,34 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug milvus_backup (interactive)",
+      "program": "${workspaceFolder}/build/duckdb",
+      "args": ["-unsigned"],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated",
+      "initCommands": [
+        "command script import ${env:HOME}/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/etc/lldb_lookup.py"
+      ],
+      "preLaunchTask": "build-debug"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug milvus_backup (run version query)",
+      "program": "${workspaceFolder}/build/duckdb",
+      "args": [
+        "-unsigned",
+        "-c",
+        "LOAD '${workspaceFolder}/build/debug/extension/milvus_backup/milvus_backup.duckdb_extension'; SELECT milvus_backup_version();"
+      ],
+      "cwd": "${workspaceFolder}",
+      "initCommands": [
+        "command script import ${env:HOME}/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/etc/lldb_lookup.py"
+      ],
+      "preLaunchTask": "build-debug"
+    }
+  ]
+}

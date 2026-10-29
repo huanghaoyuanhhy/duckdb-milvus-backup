@@ -1,0 +1,12 @@
+[package]
+name = "milvus_backup"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+duckdb-neo.workspace = true
+duckdb-loadable-macros.workspace = true
+milvus_backup_core.workspace = true

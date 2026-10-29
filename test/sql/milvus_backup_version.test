@@ -1,0 +1,16 @@
+# name: test/sql/milvus_backup_version.test
+# description: zero-parameter scalar returning the extension version
+# group: [milvus]
+
+# Before we load the extension, this will fail
+statement error
+SELECT milvus_backup_version();
+----
+Catalog Error: Scalar Function with name milvus_backup_version does not exist!
+
+require milvus_backup
+
+query T
+SELECT milvus_backup_version();
+----
+milvus_backup 0.1.0

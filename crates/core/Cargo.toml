@@ -1,0 +1,7 @@
+[package]
+name = "milvus_backup_core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+duckdb-neo.workspace = true
