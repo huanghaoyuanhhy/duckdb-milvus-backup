@@ -1,28 +1,57 @@
 # duckdb-milvus-backup
 
-用 SQL 直接读取 [Milvus](https://github.com/milvus-io/milvus) 备份的 DuckDB 扩展——在把备份恢复进一个运行中的 Milvus 实例之前,先检查里面的 collection、partition 和 binlog 数据。
+A DuckDB extension for reading [Milvus](https://github.com/milvus-io/milvus) backups with SQL—inspect collections, partitions, and binlog data before restoring a backup into a running Milvus instance.
 
-仓库初始化自实验性的 [duckdb/extension-template-rs](https://github.com/duckdb/extension-template-rs) 模板:纯 Rust 扩展,基于 DuckDB C Extension API v2(`duckdb-neo` + `duckdb-loadable-macros`,目标 DuckDB **v2.0.0**,版本必须精确匹配),无需构建 DuckDB 本体、无需 C/C++ 代码,`extension-ci-tools` 的 CI/CD 链路已预配置。
+This repository was initialized from the experimental [duckdb/extension-template-rs](https://github.com/duckdb/extension-template-rs) template. It is a pure Rust extension based on DuckDB C Extension API v2 (`duckdb-neo` + `duckdb-loadable-macros`, targeting DuckDB **v2.0.0**; versions must match exactly). It requires neither a DuckDB source build nor C/C++ code, and the `extension-ci-tools` CI/CD pipeline is preconfigured.
 
-## 路线图
+## Roadmap
 
-| 阶段 | 函数 | 状态 | 说明 |
+| Phase | Function | Status | Description |
 |---|---|---|---|
-| 0 | `milvus_backup_version()` | ✅ 已实现 | 扩展版本号,编译期烤入;同时打通 build/load/test 全管线 |
-| 1 | `milvus_backups(root_path)` | 🚧 计划中 | 备份清单:一备份一行,平铺标量列(name、id、milvus_version、created_at、size_bytes、collection_count……)。只读 meta JSON,不碰 binlog |
-| 2 | `milvus_backup_collections(root_path, backup_name)` | 🚧 计划中 | 一 collection 一行,供 WHERE/ORDER BY/JOIN;schema 等二级信息走显式选列 |
-| 3 | `milvus_backup_scan(root_path, backup_name, collection)` | 🚧 计划中 | 扫描 binlog 数据。`claim_batch` 按文件并行、projection/filter pushdown、vector 列用 `FLOAT[dim]` 定长数组 |
-| 远期 | 多 collection 扫描(schema 一致性校验)、S3 支持(具名参数传 endpoint/credential)、`milvus_backup_verify()` | 💡 | |
+| 0 | `milvus_backup_version()` | ✅ Implemented | Returns the extension version embedded at compile time; also validates the end-to-end build/load/test pipeline |
+| 1 | `milvus_backups(root_path)` | 🚧 Planned | Backup inventory: one row per backup with flat scalar columns (name, id, milvus_version, created_at, size_bytes, collection_count, etc.). Reads only meta JSON and never touches binlogs |
+| 2 | `milvus_backup_collections(root_path, backup_name)` | 🚧 Planned | One row per collection for WHERE/ORDER BY/JOIN; secondary details such as schemas are returned only through explicitly selected columns |
+| 3 | `milvus_backup_scan(root_path, backup_name, collection)` | 🚧 Planned | Scans binlog data with per-file parallelism via `claim_batch`, projection/filter pushdown, and vector columns represented as fixed-size `FLOAT[dim]` arrays |
+| Future | Multi-collection scans (schema consistency checks), S3 support (endpoint/credentials via named parameters), `milvus_backup_verify()` | 💡 | |
 
-设计原则:`SELECT *` 应能回答"这个备份可信吗、能用吗";凡是从 meta 里无法确知的信息(最终行数、完整性)给 NULL 或布尔值,不给伪造的 0/成功;指标类函数绝不读 binlog(整个桶也要秒回)。
+Design principles: `SELECT *` should answer "Can this backup be trusted and used?". Information that cannot be determined from meta, such as the final row count or integrity, is represented as NULL or a boolean rather than a fabricated 0 or success status. Metadata functions perform only meta I/O and never scan binlogs.
 
-## 使用
+## Quick Start
 
-用 `-unsigned` 启动 duckdb,按文件路径加载扩展(路径必须为绝对路径,CLI 版本须精确匹配 v2.0.0):
+### Prerequisites
 
-```sh
-./build/duckdb -unsigned
+Native builds require a Rust toolchain, Python 3 with venv support, Make, and Git.
+
+Loading the extension also requires the DuckDB **v2.0.0** CLI, exactly matching the target version. Download it from the [DuckDB v2.0.0 release](https://github.com/duckdb/duckdb/releases/tag/v2.0.0) and add it to your `PATH`. The commands below use `duckdb`; alternatively, place the CLI at `./build/duckdb` and substitute that path in the commands. The CLI is not produced by the extension build.
+
+### Build the Extension
+
+```shell
+git clone --recurse-submodules <repo-url>
+cd duckdb-milvus-backup
+
+# Create a Python venv, install the DuckDB v2.0.0 test client, and detect the platform
+DUCKDB_TEST_VERSION=v2.0.0 make configure
+
+# Build with cargo and append extension metadata; artifacts are written to build/debug
+make debug
 ```
+
+For an optimized release build, run:
+
+```shell
+make release
+```
+
+### Load and Verify
+
+Start DuckDB with `-unsigned` to load an unsigned local extension:
+
+```shell
+duckdb -unsigned
+```
+
+Use the absolute path to the extension file when loading it. The CLI version must be v2.0.0:
 
 ```sql
 LOAD '/abs/path/to/build/debug/extension/milvus_backup/milvus_backup.duckdb_extension';
@@ -39,7 +68,7 @@ SELECT milvus_backup_version();
 └─────────────────────────┘
 ```
 
-以下为规划中的接口形态(尚未实现):
+The following interfaces are planned and have not been implemented yet:
 
 ```sql
 SELECT * FROM milvus_backups('/mnt/backups');
@@ -47,55 +76,63 @@ SELECT * FROM milvus_backup_collections('/mnt/backups', 'backup_20261027');
 SELECT * FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', collection = 'messages');
 ```
 
-## 项目结构
+## Project Structure
 
-Cargo workspace 三个 crate:
+The Cargo workspace contains three crates:
 
-- `crates/core`(`milvus_backup_core`):函数实现与注册,全部扩展逻辑在这里。
-  约定:**一个函数一个文件**(`version.rs`,将来的 `backups.rs`、`collections.rs`……),每个文件自带 `pub(crate) fn register`,`lib.rs` 只有模块声明和顶层 `register`。
-- `crates/native`(`milvus_backup`):native `cdylib`,DuckDB 扩展入口。
-- `crates/wasm`(`milvus_backup_wasm`):Wasm `staticlib`,同一入口。
+- `crates/core` (`milvus_backup_core`): function implementations and registration; all extension logic lives here.
+  Convention: **one function per file** (`version.rs`, and later `backups.rs`, `collections.rs`, etc.). Each file provides its own `pub(crate) fn register`; `lib.rs` contains only module declarations and the top-level `register`.
+- `crates/native` (`milvus_backup`): the native `cdylib` and DuckDB extension entry point.
+- `crates/wasm` (`milvus_backup_wasm`): a Wasm `staticlib` using the same entry point.
 
-依赖版本在根 `Cargo.toml` 统一管理;`upgrade.sh` 同步升级 duckdb-neo / duckdb-loadable-macros / DuckDB 版本。
+Dependency versions are managed centrally in the root `Cargo.toml`; `upgrade.sh` upgrades duckdb-neo, duckdb-loadable-macros, and the DuckDB version together.
 
-## 构建
+## WASM
 
-依赖:Rust 工具链、Python3(带 venv)、Make、Git。
+In addition to the native build prerequisites, install and configure the Emscripten SDK (which provides `emcc`) and the Rust `wasm32-unknown-emscripten` target:
 
 ```shell
-git clone --recurse-submodules <repo-url>
-make configure   # 建 Python venv(装 DuckDB 测试器),探测平台
-make debug       # cargo 构建 + 追加扩展元数据,产物在 build/debug
-make release     # 优化构建
+rustup target add wasm32-unknown-emscripten
+make wasm_eh
 ```
 
-### WASM
+The output is `./build/wasm_eh/release/milvus_backup.duckdb_extension.wasm`, which DuckDB Wasm can load in Node.js or a browser.
 
-`make wasm_eh` 生成 `./build/wasm_eh/release/milvus_backup.duckdb_extension.wasm`,可在 Node.js 或浏览器中使用。
+## Testing
 
-## 测试
-
-SQLLogicTest 格式,位于 `test/sql/`,通过 `make configure` 安装的 DuckDB Python 客户端运行:
+Tests use the SQLLogicTest format and are located in `test/sql/`. They run through the DuckDB Python client installed by `make configure`. The test client must match the extension target version; the Quick Start command pins it to v2.0.0.
 
 ```shell
-make test_debug    # 或 make test_release
+make test_debug    # Or make test_release
 ```
 
-## 调试
+## Debugging
 
-已配置 VS Code 断点调试(`.vscode/`):安装 CodeLLDB 插件后直接 **F5**,选 "run version query" 自动 LOAD 并命中断点,或选 "interactive" 在集成终端里手动敲 SQL。
+VS Code breakpoint debugging is preconfigured in `.vscode/`. Install the CodeLLDB extension and press **F5**. Choose "run version query" to LOAD the extension automatically and hit breakpoints, or "interactive" to run SQL manually in the integrated terminal. The debug configurations use `./build/duckdb`; prepare the CLI as described in Quick Start.
 
-macOS 注意事项:
+macOS notes:
 
-- `build/duckdb` 官方二进制带 Hardened Runtime,调试器无法附加,需重签为 ad-hoc:`codesign --force --sign - ./build/duckdb`(重新下载 CLI 后需重做);
-- 若 `make debug` 后 LOAD 被 SIGKILL(exit 137),先 `rm` 掉旧扩展产物再构建(inode 复用导致的签名毒页问题);
-- DuckDB 内部无符号,只能调试扩展自身代码;多线程下断点乱跳时用 `SET threads TO 1`。
+- The official `build/duckdb` binary uses Hardened Runtime, which prevents debugger attachment. Re-sign it ad hoc with `codesign --force --sign - ./build/duckdb` (repeat after downloading the CLI again).
+- If LOAD is killed by SIGKILL (exit 137) after `make debug`, remove the old extension artifacts before rebuilding. This works around a signed-page poisoning issue caused by inode reuse.
+- DuckDB internals are not shipped with symbols, so only extension code can be debugged. If breakpoints jump around during multithreaded execution, use `SET threads TO 1`.
 
-### 版本切换
+### Changing the DuckDB Target Version
+
+`DUCKDB_TEST_VERSION` controls only the test client version; **it does not change the extension build target**. To change the target version, use `upgrade.sh` to update duckdb-neo, duckdb-loadable-macros, the `Makefile`, the workflow, and the extension entry point together. Both crates must correspond to the same DuckDB version.
+
+The example below uses the crate versions for v2.0.0. To target another release, update the first three variables:
 
 ```shell
+NEO_VERSION=0.20000.0
+MACROS_VERSION=1.20000.0
+DUCKDB_VERSION=v2.0.0
+
+./upgrade.sh "$NEO_VERSION" "$MACROS_VERSION"
+cargo update
 make clean_all
-DUCKDB_TEST_VERSION=v1.3.2 make configure
+DUCKDB_TEST_VERSION="$DUCKDB_VERSION" make configure
 make debug
 make test_debug
 ```
+
+`make clean_all` deletes the entire `build/` directory. If the CLI is located at `build/duckdb`, download it again and repeat the ad-hoc signing step before debugging.
