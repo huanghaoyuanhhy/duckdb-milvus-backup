@@ -1,0 +1,71 @@
+# name: test/sql/milvus_backups.test
+# description: milvus_backups(root_path) lists one row per backup under a backup root
+# group: [milvus]
+
+# Before we load the extension, this will fail
+statement error
+SELECT * FROM milvus_backups('test/fixtures/backups');
+----
+
+require milvus_backup
+
+# The fixtures are hand-written minimal backups: alpha is an old-style binlog
+# backup, beta a modern one with rbac/database_backups and an l0 segment,
+# gamma a snapshot backup (no partition/segment files), and clean a modern
+# backup without any delete records.
+
+query I
+SELECT count(*) FROM milvus_backups('test/fixtures/backups');
+----
+4
+
+# alpha: format defaults to binlog, created_at comes from start_time (ms),
+# backup_timestamp falls back to the max over collections, databases fall back
+# to the distinct collection db_name values, deletes detected through delta
+# binlogs, rbac_meta absent is unknown.
+query ITIIIIIII
+SELECT epoch_ms(created_at), format, collection_count, partition_count, segment_count, num_rows_inserted, size_bytes, has_delete_logs::INT, (has_rbac IS NULL)::INT
+FROM milvus_backups('test/fixtures/backups') WHERE name = 'alpha';
+----
+1700000000000	binlog	1	2	3	60	1234	1	1
+
+query I
+SELECT backup_timestamp FROM milvus_backups('test/fixtures/backups') WHERE name = 'alpha';
+----
+455275622782205954
+
+query TT
+SELECT databases, collection_names FROM milvus_backups('test/fixtures/backups') WHERE name = 'alpha';
+----
+[default]	[default.orders]
+
+# beta: databases from database_backups, top-level backup_timestamp wins,
+# deletes detected through the collection-level l0 segment, rbac present.
+query IIIIIIII
+SELECT databases, collection_names, collection_count, segment_count, num_rows_inserted, has_delete_logs::INT, has_rbac::INT, backup_timestamp
+FROM milvus_backups('test/fixtures/backups') WHERE name = 'beta';
+----
+[db1, db2]	[db1.messages, db1.users]	2	1	7	1	1	455999000000000000
+
+# gamma: snapshot backups have no partition/segment level (provably zero, but
+# num_rows is genuinely unknown), and no delta logs; created_at falls back to
+# the collection's backup_physical_timestamp (seconds).
+query TIIIII
+SELECT format, partition_count, segment_count, (num_rows_inserted IS NULL)::INT, has_delete_logs::INT, epoch_ms(created_at)
+FROM milvus_backups('test/fixtures/backups') WHERE name = 'gamma';
+----
+snapshot	0	0	1	0	1761830400000
+
+# clean: stub `deltalogs: [{}]` entries do not count as deletes; unknown
+# fields stay NULL.
+query IIIIII
+SELECT num_rows_inserted, has_delete_logs::INT, (has_rbac IS NULL)::INT, (created_at IS NULL)::INT, (backup_timestamp IS NULL)::INT, databases
+FROM milvus_backups('test/fixtures/backups') WHERE name = 'clean';
+----
+5	0	1	1	1	[default]
+
+# Unknown roots scan to zero rows rather than erroring.
+query I
+SELECT count(*) FROM milvus_backups('test/fixtures/does-not-exist');
+----
+0

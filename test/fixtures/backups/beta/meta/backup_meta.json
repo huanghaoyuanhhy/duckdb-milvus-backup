@@ -1,0 +1,1 @@
+{"id":"beta-id","name":"beta","format":"binlog","milvus_version":"v3.0.0","size":4321,"backup_timestamp":455999000000000000,"database_backups":[{"db_name":"db1"},{"db_name":"db2"}],"rbac_meta":{"users":[{"user_name":"alice"}]}}

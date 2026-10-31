@@ -9,10 +9,10 @@ This repository was initialized from the experimental [duckdb/extension-template
 | Phase | Function | Status | Description |
 |---|---|---|---|
 | 0 | `milvus_backup_version()` | ✅ Implemented | Returns the extension version embedded at compile time; also validates the end-to-end build/load/test pipeline |
-| 1 | `milvus_backups(root_path)` | 🚧 Planned | Backup inventory: one row per backup with flat scalar columns (name, id, milvus_version, created_at, size_bytes, collection_count, etc.). Reads only meta JSON and never touches binlogs |
+| 1 | `milvus_backups(root_path)` | ✅ Implemented | Backup inventory: one row per backup with flat scalar columns (name, id, milvus_version, created_at, size_bytes, collection_count, etc.). Accepts local paths and `s3://` URIs (through DuckDB's file system), reads only meta JSON, and never touches binlogs |
 | 2 | `milvus_backup_collections(root_path, backup_name)` | 🚧 Planned | One row per collection for WHERE/ORDER BY/JOIN; secondary details such as schemas are returned only through explicitly selected columns |
 | 3 | `milvus_backup_scan(root_path, backup_name, collection)` | 🚧 Planned | Scans binlog data with per-file parallelism via `claim_batch`, projection/filter pushdown, and vector columns represented as fixed-size `FLOAT[dim]` arrays |
-| Future | Multi-collection scans (schema consistency checks), S3 support (endpoint/credentials via named parameters), `milvus_backup_verify()` | 💡 | |
+| Future | Multi-collection scans (schema consistency checks), `milvus_backup_verify()` | 💡 | |
 
 Design principles: `SELECT *` should answer "Can this backup be trusted and used?". Information that cannot be determined from meta, such as the final row count or integrity, is represented as NULL or a boolean rather than a fabricated 0 or success status. Metadata functions perform only meta I/O and never scan binlogs.
 
@@ -68,10 +68,28 @@ SELECT milvus_backup_version();
 └─────────────────────────┘
 ```
 
+List the backups under a root path — one row per backup:
+
+```sql
+SELECT name, milvus_version, format, collection_names, num_rows_inserted
+FROM milvus_backups('/mnt/backups');
+```
+
+```
+┌─────────┬────────────────┬─────────┬──────────────────┬───────────────────┐
+│  name   │ milvus_version │ format  │ collection_names │ num_rows_inserted │
+│ varchar │    varchar     │ varchar │    varchar[]     │       int64       │
+├─────────┼────────────────┼─────────┼──────────────────┼───────────────────┤
+│ backup1 │ v2.5.2         │ binlog  │ [messages]       │              3500 │
+│ backup2 │ v3.0.0         │ snapshot│ [docs]           │              NULL │
+└─────────┴────────────────┴─────────┴──────────────────┴───────────────────┘
+```
+
+`root_path` can also point to object storage through DuckDB's file system — load `httpfs`, set up credentials (`CREATE SECRET`), then pass an `s3://` URI. Columns that a backup's meta does not carry (for example `has_rbac` on older backups, or `num_rows_inserted` on snapshot backups) are NULL, never a fabricated value.
+
 The following interfaces are planned and have not been implemented yet:
 
 ```sql
-SELECT * FROM milvus_backups('/mnt/backups');
 SELECT * FROM milvus_backup_collections('/mnt/backups', 'backup_20261027');
 SELECT * FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', collection = 'messages');
 ```

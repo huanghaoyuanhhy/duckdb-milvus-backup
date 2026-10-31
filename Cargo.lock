@@ -246,6 +246,8 @@ name = "milvus_backup_core"
 version = "0.1.0"
 dependencies = [
  "duckdb-neo",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
