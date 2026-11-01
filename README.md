@@ -11,8 +11,8 @@ This repository was initialized from the experimental [duckdb/extension-template
 | 0 | `milvus_backup_version()` | ✅ Implemented | Returns the extension version embedded at compile time; also validates the end-to-end build/load/test pipeline |
 | 1 | `milvus_backups(root_path)` | ✅ Implemented | Backup inventory: one row per backup with flat scalar columns (name, id, milvus_version, created_at, size_bytes, collection_count, etc.). Accepts local paths and `s3://` URIs (through DuckDB's file system), reads only meta JSON, and never touches binlogs |
 | 2 | `milvus_backup_collections(root_path, backup_name)` | ✅ Implemented | One row per collection with identity (db/collection/id), timing (TSO + physical timestamp), shape (`fields` as `LIST(STRUCT)` with types/dim), volume (partition/segment counts, rows, size) and health (indexes, delete logs) columns; partition/segment entries without collection ids in old backups leave the affected columns NULL rather than zero |
-| 3 | `milvus_backup_scan(root_path, backup_name, collection)` | 🚧 Planned | Scans binlog data with per-file parallelism via `claim_batch`, projection/filter pushdown, and vector columns represented as fixed-size `FLOAT[dim]` arrays |
-| Future | Multi-collection scans (schema consistency checks), `milvus_backup_verify()` | 💡 | |
+| 3 | `milvus_backup_scan(root_path, backup_name, collection)` | ✅ Implemented | Reads binlog rows with a built-in parquet reader (storage v1 envelopes and bare storage-v2 files), one segment per scan thread via `claim_batch`, projection pushdown, and delta-log tombstones applied by default. Vectors decode to fixed-size `FLOAT[dim]` arrays, sparse vectors to `STRUCT(indices, values)`; JSON fields stay VARCHAR and geometry/other vector kinds pass through as BLOB |
+| Future | Multi-collection scans (schema consistency checks), snapshot-format data scans, `milvus_backup_verify()` | 💡 | |
 
 Design principles: `SELECT *` should answer "Can this backup be trusted and used?". Information that cannot be determined from meta, such as the final row count or integrity, is represented as NULL or a boolean rather than a fabricated 0 or success status. Metadata functions perform only meta I/O and never scan binlogs.
 
@@ -68,21 +68,22 @@ SELECT milvus_backup_version();
 └─────────────────────────┘
 ```
 
-List the backups under a root path — one row per backup:
+List the backups under a root path — one row per backup. `collection_names` entries are qualified `db.collection` names:
 
 ```sql
-SELECT name, milvus_version, format, collection_names, num_rows_inserted
+SELECT name, milvus_version, format, databases, collection_names,
+       num_rows_inserted, has_delete_logs, has_rbac
 FROM milvus_backups('/mnt/backups');
 ```
 
 ```
-┌─────────┬────────────────┬─────────┬──────────────────┬───────────────────┐
-│  name   │ milvus_version │ format  │ collection_names │ num_rows_inserted │
-│ varchar │    varchar     │ varchar │    varchar[]     │       int64       │
-├─────────┼────────────────┼─────────┼──────────────────┼───────────────────┤
-│ backup1 │ v2.5.2         │ binlog  │ [messages]       │              3500 │
-│ backup2 │ v3.0.0         │ snapshot│ [docs]           │              NULL │
-└─────────┴────────────────┴─────────┴──────────────────┴───────────────────┘
+┌─────────────────┬────────────────┬──────────┬────────────┬───────────────────────────┬───────────────────┬─────────────────┬──────────┐
+│      name       │ milvus_version │  format  │ databases  │     collection_names      │ num_rows_inserted │ has_delete_logs │ has_rbac │
+│     varchar     │    varchar     │ varchar  │ varchar[]  │         varchar[]         │       int64       │     boolean     │ boolean  │
+├─────────────────┼────────────────┼──────────┼────────────┼───────────────────────────┼───────────────────┼─────────────────┼──────────┤
+│ backup_20261027 │ v3.0.0         │ binlog   │ [db1, db2] │ [db1.messages, db1.users] │                 7 │ true            │ true     │
+│ backup_20261101 │ v3.0.0         │ snapshot │ [db9]      │ [db9.docs]                │              NULL │ false           │ NULL     │
+└─────────────────┴────────────────┴──────────┴────────────┴───────────────────────────┴───────────────────┴─────────────────┴──────────┘
 ```
 
 `root_path` can also point to object storage through DuckDB's file system — load `httpfs`, set up credentials (`CREATE SECRET`), then pass an `s3://` URI. Columns that a backup's meta does not carry (for example `has_rbac` on older backups, or `num_rows_inserted` on snapshot backups) are NULL, never a fabricated value.
@@ -93,23 +94,53 @@ Drill into one backup — one row per collection, with schema fields and indexes
 SELECT collection_name, db_name, num_rows_inserted, partition_names,
        fields[1].name AS pk_field, fields[2].dim AS vector_dim
 FROM milvus_backup_collections('/mnt/backups', 'backup_20261027');
+```
 
+```
+┌─────────────────┬─────────┬───────────────────┬─────────────────┬──────────┬────────────┐
+│ collection_name │ db_name │ num_rows_inserted │ partition_names │ pk_field │ vector_dim │
+│     varchar     │ varchar │       int64       │    varchar[]    │ varchar  │   int64    │
+├─────────────────┼─────────┼───────────────────┼─────────────────┼──────────┼────────────┤
+│ messages        │ db1     │                 7 │ [_default]      │ id       │          4 │
+│ users           │ db1     │              NULL │ NULL            │ NULL     │       NULL │
+└─────────────────┴─────────┴───────────────────┴─────────────────┴──────────┴────────────┘
+```
+
+Partition/segment aggregates are attributed by collection id; entries without ids in old backups leave the affected columns NULL rather than zero (the `users` row above).
+
+```sql
 SELECT collection_name, num_rows_inserted
 FROM milvus_backup_collections('/mnt/backups/backup_20261027');
 ```
 
-The following interfaces are planned and have not been implemented yet:
+### Read Collection Rows
 
 ```sql
-SELECT * FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', collection = 'messages');
+-- Final rows: delta-log tombstones are applied by default, matching what a
+-- restored Milvus would return.
+SELECT count(*) FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', 'messages');
+
+-- Raw inserted rows, including those later deleted or upserted away.
+SELECT count(*) FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', 'messages', apply_deletes = false);
+
+-- Full rows; vector columns arrive as FLOAT[dim] arrays.
+SELECT id, vector[1:4] FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', 'messages') WHERE id = 42;
+
+-- Projection pushdown: only the referenced files are read, so counting rows
+-- never decodes vector data.
+SELECT id FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', 'messages') LIMIT 10;
 ```
+
+Named options: `apply_deletes` (default `true`) applies delta-log tombstones using Milvus's semantics (a row dies when a delete record for its primary key carries a strictly larger timestamp); `include_system` (default `false`) prepends `__row_id` (field 0) and `__timestamp` (the raw TSO, field 1).
+
+Collection names may be ambiguous across databases; qualify them as `db.collection` when needed. The scan supports local paths and `s3://` URIs (credentials come from httpfs). Snapshot-format backups (`format = "snapshot"`) carry no segment meta and are rejected with a clear error for now.
 
 ## Project Structure
 
 The Cargo workspace contains three crates:
 
 - `crates/core` (`milvus_backup_core`): function implementations and registration; all extension logic lives here.
-  Convention: **one function per file** (`version.rs`, and later `backups.rs`, `collections.rs`, etc.). Each file provides its own `pub(crate) fn register`; `lib.rs` contains only module declarations and the top-level `register`.
+  Convention: **one function per file** (`version.rs`, `backups.rs`, `collections.rs`, etc.). Each file provides its own `pub(crate) fn register`; `lib.rs` contains only module declarations and the top-level `register`.
 - `crates/native` (`milvus_backup`): the native `cdylib` and DuckDB extension entry point.
 - `crates/wasm` (`milvus_backup_wasm`): a Wasm `staticlib` using the same entry point.
 
