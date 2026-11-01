@@ -33,7 +33,8 @@ use duckdb_neo::{
 };
 
 use crate::meta::{
-    backup_dir, constant_string, normalize_root, parse_json, read_infos, read_required,
+    backup_dir, constant_string, normalize_root, parse_json, read_full_meta_l0, read_infos,
+    read_required,
 };
 
 pub(crate) struct CollectionsFunction;
@@ -208,9 +209,21 @@ fn bind_backup_dir(
 
     // collection_meta.json is written by every format (snapshot included),
     // so its absence means a corrupt backup, not an empty one.
-    let colls: Vec<CollectionInfo> = read_infos(&fs, dir, "collection_meta")?.ok_or_else(|| {
-        Error::invalid_input(format!("file not found: {dir}/meta/collection_meta.json"))
-    })?;
+    let mut colls: Vec<CollectionInfo> = read_infos(&fs, dir, "collection_meta")?.ok_or_else(
+        || Error::invalid_input(format!("file not found: {dir}/meta/collection_meta.json")),
+    )?;
+    // Newer writers record L0 segments only in full_meta.json; merge them in
+    // so has_delete_logs stays truthful.
+    {
+        let l0_by_collection = read_full_meta_l0(&fs, dir)?;
+        for coll in colls.iter_mut() {
+            if coll.l0_segments.is_none() {
+                if let Some(collection_id) = coll.collection_id {
+                    coll.l0_segments = l0_by_collection.get(&collection_id).cloned();
+                }
+            }
+        }
+    }
     let partitions = read_infos(&fs, dir, "partition_meta")?;
     let segments = read_infos(&fs, dir, "segment_meta")?;
 

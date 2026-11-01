@@ -27,7 +27,9 @@ use duckdb_neo::{
     types::{List, TimestampTzValue},
 };
 
-use crate::meta::{constant_string, normalize_root, parse_json, read_infos, read_required};
+use crate::meta::{
+    constant_string, normalize_root, parse_json, read_full_meta_l0, read_infos, read_required,
+};
 
 pub(crate) struct BackupsFunction;
 
@@ -307,7 +309,7 @@ impl BackupRow {
                     colls
                         .iter()
                         .any(|coll| coll.l0_segments.as_ref().is_some_and(|l0| !l0.is_empty()))
-                });
+                }) || !read_full_meta_l0(fs, dir)?.is_empty();
                 Some(
                     has_l0
                         || segments.iter().any(|segment| {

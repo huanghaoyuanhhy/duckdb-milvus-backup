@@ -36,7 +36,10 @@ use duckdb_neo::{
 };
 
 use crate::binlog::{self, BinlogKind};
-use crate::meta::{backup_dir, constant_string, normalize_root, parse_json, read_infos, read_required};
+use crate::meta::{
+    backup_dir, constant_string, normalize_root, parse_json, read_full_meta_l0, read_infos,
+    read_required,
+};
 use crate::parquet::{self, ChunkReader, ColumnData, FileView, Values};
 use crate::paths::backup_log_paths;
 use crate::schema::{self, MilvusField, TargetKind};
@@ -290,6 +293,18 @@ fn bind_impl(
         .find(|field| field.is_primary_key)
         .map(|field| field.field_id);
 
+    // L0 (delete-only) segments: level-file entries, falling back to
+    // full_meta.json where newer writers record them exclusively.
+    let full_meta_l0: Vec<SegmentEntry> = if target.l0_segments.is_none() {
+        resolve_full_meta_l0(&fs, dir, collection_id)?
+    } else {
+        Vec::new()
+    };
+    let collection_l0: &[SegmentEntry] = match &target.l0_segments {
+        Some(l0) => l0,
+        None => &full_meta_l0,
+    };
+
     let mut columns: Vec<OutputColumn> = Vec::new();
     if include_system {
         columns.push(OutputColumn {
@@ -311,7 +326,10 @@ fn bind_impl(
         });
     }
 
-    if apply_deletes && pk_field_id.is_none() && collection_has_delta_sources(target) {
+    if apply_deletes
+        && pk_field_id.is_none()
+        && collection_l0.iter().any(|l0| !delta_paths(l0).is_empty())
+    {
         return Err(Error::invalid_input(format!(
             "collection {collection_arg} has delete logs but its schema has no primary key \
              field; pass apply_deletes = false to read raw rows"
@@ -371,7 +389,7 @@ fn bind_impl(
             unattributed,
         });
     }
-    for l0 in target.l0_segments.iter().flatten() {
+    for l0 in collection_l0 {
         collect_delta_candidates(l0, &mut delta_sources);
     }
     tasks.sort_by_key(|task| task.segment_id);
@@ -446,12 +464,27 @@ fn qualified_name(entry: &CollectionEntry) -> Option<String> {
     }
 }
 
-/// Whether collection-level L0 entries carry delta logs (meta-only check).
-fn collection_has_delta_sources(target: &CollectionEntry) -> bool {
-    target
-        .l0_segments
-        .as_ref()
-        .is_some_and(|l0| l0.iter().any(|segment| !delta_paths(segment).is_empty()))
+/// L0 segments of one collection from `full_meta.json`, parsed into
+/// [`SegmentEntry`]. Empty when the file is absent or records none.
+fn resolve_full_meta_l0(
+    fs: &FileSystem<'_>,
+    dir: &str,
+    collection_id: i64,
+) -> Result<Vec<SegmentEntry>> {
+    let Some(values) = read_full_meta_l0(fs, dir)?.remove(&collection_id) else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|error| {
+                Error::invalid_input(format!(
+                    "failed to parse an L0 segment of collection {collection_id} in \
+                     full_meta.json: {error}"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn delta_paths(segment: &SegmentEntry) -> Vec<&String> {

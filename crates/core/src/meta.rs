@@ -2,10 +2,13 @@
 //! `FileSystem` (local paths and `s3://` via httpfs alike).
 //!
 //! Backup layout: `{root}/{name}/meta/{backup,collection,partition,segment}_meta.json`,
-//! each level file wrapping its entries as `{"infos": [...]}`. `full_meta.json`
-//! is deliberately never read: the per-level files cover old, modern and
-//! snapshot writer formats uniformly. Only meta JSON is ever read, never
-//! binlog data.
+//! each level file wrapping its entries as `{"infos": [...]}`. The per-level
+//! files cover old, modern and snapshot writer formats uniformly, so
+//! `full_meta.json` is only read for the one thing newer writers record
+//! exclusively there: collection-level L0 segments (see [`read_full_meta_l0`]).
+//! Only meta JSON is ever read, never binlog data.
+
+use std::collections::HashMap;
 
 use serde::Deserialize;
 
@@ -53,6 +56,38 @@ pub(crate) fn read_infos<T: serde::de::DeserializeOwned>(
 pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8], path: &str) -> Result<T> {
     serde_json::from_slice(bytes)
         .map_err(|error| Error::invalid_input(format!("failed to parse {path}: {error}")))
+}
+
+/// Collection-level L0 (delete-only) segments per collection id, taken from
+/// `full_meta.json`. Milvus 2.6-era writers record L0 segments only in the
+/// full tree and leave `l0_segments` out of `collection_meta.json`, so the
+/// level files alone under-report delete data. Returns an empty map when the
+/// file is absent (old backups) or carries no L0.
+pub(crate) fn read_full_meta_l0(
+    fs: &FileSystem,
+    dir: &str,
+) -> Result<HashMap<i64, Vec<serde_json::Value>>> {
+    let path = format!("{dir}/meta/full_meta.json");
+    let Some(bytes) = read_optional(fs, &path)? else {
+        return Ok(HashMap::new());
+    };
+    let value: serde_json::Value = parse_json(&bytes, &path)?;
+    let mut out: HashMap<i64, Vec<serde_json::Value>> = HashMap::new();
+    let Some(collections) = value.get("collection_backups").and_then(|v| v.as_array()) else {
+        return Ok(out);
+    };
+    for collection in collections {
+        let Some(id) = collection.get("collection_id").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let Some(l0) = collection.get("l0_segments").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if !l0.is_empty() {
+            out.entry(id).or_default().extend(l0.iter().cloned());
+        }
+    }
+    Ok(out)
 }
 
 /// Path of a backup directory inside a backup root, rejecting names that
