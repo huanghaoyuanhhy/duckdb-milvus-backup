@@ -1,3 +1,4 @@
+mod avro;
 mod backups;
 mod binlog;
 mod collections;
@@ -6,6 +7,7 @@ mod parquet;
 mod paths;
 mod scan;
 mod schema;
+mod snapshot;
 mod tombstone;
 mod version;
 

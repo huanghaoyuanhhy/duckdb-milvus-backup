@@ -224,6 +224,26 @@ fn bind_backup_dir(
             }
         }
     }
+    // Snapshot-format collections: read the cheap counts their bundle
+    // metadata JSON declares (manifest count, partition map). Metadata-only —
+    // the per-segment avro manifests stay unread here.
+    if backup_meta.format.as_deref() == Some("snapshot") {
+        for coll in colls.iter_mut() {
+            let Some(snapshot_backup) = &coll.snapshot_backup else {
+                continue;
+            };
+            match crate::snapshot::count_bundle(&fs, dir, snapshot_backup) {
+                Ok(counts) => {
+                    coll.bundle_partition_count = counts.partition_count;
+                    coll.bundle_segment_count = Some(counts.segment_count);
+                    coll.bundle_partition_names = counts.partition_names;
+                }
+                // A missing or unreadable bundle stays "unknown" rather than
+                // failing the whole inventory; scan surfaces the real error.
+                Err(_) => {}
+            }
+        }
+    }
     let partitions = read_infos(&fs, dir, "partition_meta")?;
     let segments = read_infos(&fs, dir, "segment_meta")?;
 
@@ -486,21 +506,23 @@ fn build_rows(
             };
 
             // Provable absence (snapshot format, no level file) reports zero;
-            // everything else that cannot be attributed reports NULL.
-            let partition_count = match (partitions.as_ref(), collection_id) {
+            // everything else that cannot be attributed reports NULL. A
+            // snapshot bundle that was readable supplies the real counts and
+            // wins over the level-file derivation.
+            let partition_count = coll.bundle_partition_count.or(match (partitions.as_ref(), collection_id) {
                 (_, None) => None,
                 (None, Some(_)) if is_snapshot => Some(0),
                 (None, Some(_)) => None,
                 (Some(_), Some(_)) if partitions_unattributed => None,
                 (Some(_), Some(_)) => Some(owned_partitions.len() as i64),
-            };
-            let segment_count = match (segments.as_ref(), collection_id) {
+            });
+            let segment_count = coll.bundle_segment_count.or(match (segments.as_ref(), collection_id) {
                 (_, None) => None,
                 (None, Some(_)) if is_snapshot => Some(0),
                 (None, Some(_)) => None,
                 (Some(_), Some(_)) if segments_unattributed => None,
                 (Some(_), Some(_)) => Some(owned_segments.len() as i64),
-            };
+            });
 
             let num_rows_inserted = match (&segments, collection_id) {
                 // An incomplete attribution would make the sum a lower bound,
@@ -514,29 +536,39 @@ fn build_rows(
                 _ => None,
             };
 
-            let partition_names = match (&partitions, collection_id) {
-                (_, None) => None,
-                (None, Some(_)) if is_snapshot => Some(Vec::new()),
-                (None, Some(_)) => None,
-                (Some(_), Some(_)) if partitions_unattributed => None,
-                (Some(_), Some(_)) => Some(
-                    owned_partitions
-                        .iter()
-                        .filter_map(|partition| partition.partition_name.clone())
-                        .collect(),
-                ),
-            };
+            let partition_names = coll
+                .bundle_partition_names
+                .clone()
+                .or(match (&partitions, collection_id) {
+                    (_, None) => None,
+                    (None, Some(_)) if is_snapshot => Some(Vec::new()),
+                    (None, Some(_)) => None,
+                    (Some(_), Some(_)) if partitions_unattributed => None,
+                    (Some(_), Some(_)) => Some(
+                        owned_partitions
+                            .iter()
+                            .filter_map(|partition| partition.partition_name.clone())
+                            .collect(),
+                    ),
+                });
 
             // L0 segments are pure delta data at collection level, so their
             // existence alone proves deletes; everything else needs the
-            // segment file attributed.
+            // segment file attributed. A readable snapshot bundle hides its
+            // delta logs behind per-segment avro manifests (not read here),
+            // so deletes are unknown rather than provably absent.
+            let bundle_read = coll.bundle_segment_count.is_some();
             let l0_has_data = coll.l0_segments.as_ref().is_some_and(|l0| !l0.is_empty());
             let has_delete_logs = if l0_has_data {
                 Some(true)
             } else if segments.is_none() {
                 // Snapshot backups provably have no segment level; a missing
                 // level file in a binlog backup is unread state.
-                if is_snapshot { Some(false) } else { None }
+                if is_snapshot && !bundle_read {
+                    Some(false)
+                } else {
+                    None
+                }
             } else if deletes_unattributed {
                 None
             } else {
@@ -687,6 +719,17 @@ struct CollectionInfo {
     aliases: Option<Vec<String>>,
     /// L0 delta segments live at collection level, not under partitions.
     l0_segments: Option<Vec<serde_json::Value>>,
+    /// Snapshot-format backups: where the exported bundle lives.
+    #[serde(default)]
+    snapshot_backup: Option<crate::snapshot::SnapshotBackupInfo>,
+    /// Filled at bind from the bundle metadata JSON; NULL unless the bundle
+    /// was readable.
+    #[serde(default)]
+    bundle_partition_count: Option<i64>,
+    #[serde(default)]
+    bundle_segment_count: Option<i64>,
+    #[serde(default)]
+    bundle_partition_names: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]

@@ -95,20 +95,20 @@ impl ColumnSource {
     }
 }
 
-struct SegmentTask {
-    segment_id: i64,
+pub(crate) struct SegmentTask {
+    pub(crate) segment_id: i64,
     /// Every insert-log file of the segment, in meta order. Milvus 2.6+
     /// writes column-group ids (or nothing) into the meta's `fieldID`, so the
     /// true field mapping is discovered by opening each file at task-cursor
     /// build time (envelope descriptor / parquet field ids); `declared` is
     /// only a fallback for footers without field-id annotations.
-    files: Vec<SegmentFile>,
+    pub(crate) files: Vec<SegmentFile>,
 }
 
-struct SegmentFile {
-    candidates: Vec<String>,
+pub(crate) struct SegmentFile {
+    pub(crate) candidates: Vec<String>,
     /// fieldID the meta attributes this file to, when present.
-    declared: Option<i64>,
+    pub(crate) declared: Option<i64>,
 }
 
 // --- duckdb-neo plumbing ----------------------------------------------------
@@ -269,12 +269,7 @@ fn bind_impl(
     }
     let backup_meta: BackupMeta =
         parse_json(&read_required(&fs, &backup_meta_path)?, &backup_meta_path)?;
-    if backup_meta.format.as_deref() == Some("snapshot") {
-        return Err(Error::invalid_input(
-            "snapshot-format backups carry no segment meta; milvus_backup_scan does not \
-             support them yet",
-        ));
-    }
+    let is_snapshot = backup_meta.format.as_deref() == Some("snapshot");
 
     let colls: Vec<CollectionEntry> = read_infos(&fs, dir, "collection_meta")?.ok_or_else(|| {
         Error::invalid_input(format!("file not found: {dir}/meta/collection_meta.json"))
@@ -299,7 +294,9 @@ fn bind_impl(
         .map(|field| field.field_id);
 
     // L0 (delete-only) segments: level-file entries, falling back to
-    // full_meta.json where newer writers record them exclusively.
+    // full_meta.json where newer writers record them exclusively. Snapshot
+    // backups carry neither file (their L0 segments live in the bundle
+    // manifests), so this resolves empty for them.
     let full_meta_l0: Vec<SegmentEntry> = if target.l0_segments.is_none() {
         resolve_full_meta_l0(&fs, dir, collection_id)?
     } else {
@@ -331,69 +328,92 @@ fn bind_impl(
         });
     }
 
-    if apply_deletes
-        && pk_field_id.is_none()
-        && collection_l0.iter().any(|l0| !delta_paths(l0).is_empty())
-    {
-        return Err(Error::invalid_input(format!(
-            "collection {collection_arg} has delete logs but its schema has no primary key \
-             field; pass apply_deletes = false to read raw rows"
-        )));
-    }
-
-    // Segment attribution mirrors milvus_backup_collections: by collection
-    // id, falling back to the owning partition's id.
-    let partitions: Vec<PartitionEntry> = read_infos(&fs, dir, "partition_meta")?.unwrap_or_default();
-    let segments: Vec<SegmentEntry> = read_infos(&fs, dir, "segment_meta")?.unwrap_or_default();
-    let partition_owner: HashMap<i64, i64> = partitions
-        .iter()
-        .filter_map(|partition| Some((partition.partition_id?, partition.collection_id?)))
-        .collect();
-
-    let mut tasks = Vec::new();
-    let mut delta_sources: Vec<Vec<String>> = Vec::new();
-    let mut estimated_rows = 0u64;
-    for segment in &segments {
-        let owner = segment
-            .collection_id
-            .or_else(|| partition_owner.get(&segment.partition_id?).copied());
-        if owner != Some(collection_id) {
-            continue;
+    // Task and tombstone-source derivation differs by backup format: snapshot
+    // backups walk the exported bundle (avro segment manifests, milvus-storage
+    // manifests for storage-v3 segments), binlog backups the level meta files.
+    let (tasks, delta_sources, estimated_rows) = if is_snapshot {
+        let snapshot_backup = target.snapshot_backup.as_ref().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "collection {collection_arg} is in a snapshot-format backup but records no \
+                 snapshot bundle path; the backup was written by an older milvus-backup"
+            ))
+        })?;
+        let bundle = crate::snapshot::load_bundle(&fs, dir, snapshot_backup)?;
+        let plan = crate::snapshot::build_plan(&fs, dir, &bundle)?;
+        if apply_deletes && pk_field_id.is_none() && !plan.delta_sources.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "collection {collection_arg} has delete logs but its schema has no primary \
+                 key field; pass apply_deletes = false to read raw rows"
+            )));
         }
-        // Delete-only segments (L0 flagged or legacy delta-only entries
-        // without an is_l0 key) carry no insert logs; they are tombstone
-        // sources, not data tasks.
-        let has_insert_logs = segment
-            .binlogs
+        (plan.tasks, plan.delta_sources, plan.estimated_rows)
+    } else {
+        if apply_deletes
+            && pk_field_id.is_none()
+            && collection_l0.iter().any(|l0| !delta_paths(l0).is_empty())
+        {
+            return Err(Error::invalid_input(format!(
+                "collection {collection_arg} has delete logs but its schema has no primary \
+                 key field; pass apply_deletes = false to read raw rows"
+            )));
+        }
+
+        // Segment attribution mirrors milvus_backup_collections: by collection
+        // id, falling back to the owning partition's id.
+        let partitions: Vec<PartitionEntry> =
+            read_infos(&fs, dir, "partition_meta")?.unwrap_or_default();
+        let segments: Vec<SegmentEntry> = read_infos(&fs, dir, "segment_meta")?.unwrap_or_default();
+        let partition_owner: HashMap<i64, i64> = partitions
             .iter()
-            .any(|field| field.binlogs.iter().any(|entry| entry.log_path.is_some()));
-        if segment.is_l0.unwrap_or(false) || !has_insert_logs {
-            collect_delta_candidates(segment, &mut delta_sources);
-            continue;
-        }
-        let mut files: Vec<SegmentFile> = Vec::new();
-        for field_log in &segment.binlogs {
-            for binlog_entry in &field_log.binlogs {
-                let Some(log_path) = &binlog_entry.log_path else { continue };
-                let candidates =
-                    backup_log_paths(log_path, segment.group_id, segment.partition_id)?;
-                files.push(SegmentFile {
-                    candidates,
-                    declared: field_log.field_id,
-                });
+            .filter_map(|partition| Some((partition.partition_id?, partition.collection_id?)))
+            .collect();
+
+        let mut tasks = Vec::new();
+        let mut delta_sources: Vec<Vec<String>> = Vec::new();
+        let mut estimated_rows = 0u64;
+        for segment in &segments {
+            let owner = segment
+                .collection_id
+                .or_else(|| partition_owner.get(&segment.partition_id?).copied());
+            if owner != Some(collection_id) {
+                continue;
             }
+            // Delete-only segments (L0 flagged or legacy delta-only entries
+            // without an is_l0 key) carry no insert logs; they are tombstone
+            // sources, not data tasks.
+            let has_insert_logs = segment
+                .binlogs
+                .iter()
+                .any(|field| field.binlogs.iter().any(|entry| entry.log_path.is_some()));
+            if segment.is_l0.unwrap_or(false) || !has_insert_logs {
+                collect_delta_candidates(segment, &mut delta_sources);
+                continue;
+            }
+            let mut files: Vec<SegmentFile> = Vec::new();
+            for field_log in &segment.binlogs {
+                for binlog_entry in &field_log.binlogs {
+                    let Some(log_path) = &binlog_entry.log_path else { continue };
+                    let candidates =
+                        backup_log_paths(log_path, segment.group_id, segment.partition_id)?;
+                    files.push(SegmentFile {
+                        candidates,
+                        declared: field_log.field_id,
+                    });
+                }
+            }
+            collect_delta_candidates(segment, &mut delta_sources);
+            estimated_rows += segment.num_of_rows.unwrap_or(0).max(0) as u64;
+            tasks.push(SegmentTask {
+                segment_id: segment.segment_id.unwrap_or(-1),
+                files,
+            });
         }
-        collect_delta_candidates(segment, &mut delta_sources);
-        estimated_rows += segment.num_of_rows.unwrap_or(0).max(0) as u64;
-        tasks.push(SegmentTask {
-            segment_id: segment.segment_id.unwrap_or(-1),
-            files,
-        });
-    }
-    for l0 in collection_l0 {
-        collect_delta_candidates(l0, &mut delta_sources);
-    }
-    tasks.sort_by_key(|task| task.segment_id);
+        for l0 in collection_l0 {
+            collect_delta_candidates(l0, &mut delta_sources);
+        }
+        tasks.sort_by_key(|task| task.segment_id);
+        (tasks, delta_sources, estimated_rows)
+    };
 
     bind_handle.set_cardinality(estimated_rows as usize, true)?;
     bind_handle.set_order(OrderPreservation::None)?;
@@ -636,6 +656,9 @@ struct FieldCursor {
     field_id: i64,
     field_name: String,
     target: TargetKind,
+    /// Milvus TEXT fields in milvus-storage packed files carry a 1-byte LOB
+    /// flag before every value (inline payload or a Vortex-file reference).
+    text_lob: bool,
     /// Remaining files of this field, in meta order.
     files: VecDeque<FileSource>,
     /// Remaining (view, leaf, chunk) triples of the current unit.
@@ -666,6 +689,7 @@ impl FieldCursor {
                     &leaf,
                     &self.target,
                     &self.field_name,
+                    self.text_lob,
                 )?);
             }
             if self.cells.is_empty() && self.chunks.is_empty() && self.files.is_empty() {
@@ -1109,6 +1133,7 @@ fn build_column_cursor(
         field_id,
         field_name,
         target: column.target.clone(),
+        text_lob: matches!(&column.source, ColumnSource::Field(field) if field.data_type == schema::T_TEXT),
         files,
         chunks: VecDeque::new(),
         cells: VecDeque::new(),
@@ -1136,9 +1161,10 @@ fn cells_from_data(
     leaf: &parquet::SchemaLeaf,
     target: &TargetKind,
     field_name: &str,
+    text_lob: bool,
 ) -> Result<VecDeque<Cell>> {
     if matches!(target, TargetKind::List(_)) {
-        return list_cells(data, leaf, target, field_name);
+        return list_cells(data, leaf, target, field_name, text_lob);
     }
     let mut cells = VecDeque::with_capacity(data.rows());
     let mut value_index = 0usize;
@@ -1147,7 +1173,13 @@ fn cells_from_data(
             cells.push_back(Cell::Null);
             continue;
         }
-        cells.push_back(value_cell(&data.values, value_index, target, field_name)?);
+        cells.push_back(value_cell(
+            &data.values,
+            value_index,
+            target,
+            field_name,
+            text_lob,
+        )?);
         value_index += 1;
     }
     Ok(cells)
@@ -1158,6 +1190,7 @@ fn value_cell(
     index: usize,
     target: &TargetKind,
     field_name: &str,
+    text_lob: bool,
 ) -> Result<Cell> {
     let mismatch = |expected: &str| {
         Error::invalid_input(format!(
@@ -1206,7 +1239,14 @@ fn value_cell(
             }
             other => return Err(mismatch(&format!("DOUBLE (got {other:?})"))),
         },
-        TargetKind::VarChar => Cell::Bytes(take_bytes(values, index, field_name)?),
+        TargetKind::VarChar => {
+            let bytes = take_bytes(values, index, field_name)?;
+            if text_lob {
+                decode_text_lob(&bytes, field_name)?
+            } else {
+                Cell::Bytes(bytes)
+            }
+        }
         TargetKind::Blob => Cell::Bytes(take_bytes(values, index, field_name)?),
         TargetKind::FloatArray(dim) => {
             let bytes = take_bytes(values, index, field_name)?;
@@ -1267,6 +1307,21 @@ fn decode_sparse(bytes: &[u8], field_name: &str) -> Result<(Vec<u32>, Vec<f32>)>
     Ok((indices, values))
 }
 
+/// milvus-storage LOB encoding for TEXT fields (lob_reference.h): every value
+/// is flagged — `0x00` + inline payload, or `0x01` + a 24-byte reference into
+/// partition-level Vortex files. Values without a flag prefix come from
+/// writers that never enabled LOB for the column and pass through as-is.
+fn decode_text_lob(bytes: &[u8], field_name: &str) -> Result<Cell> {
+    match bytes.first() {
+        Some(0x00) => Ok(Cell::Bytes(bytes[1..].to_vec())),
+        Some(0x01) if bytes.len() == 24 => Err(Error::invalid_input(format!(
+            "field {field_name}: row is a LOB reference into a Vortex file, which this \
+             build cannot read yet (large TEXT values only)"
+        ))),
+        _ => Ok(Cell::Bytes(bytes.to_vec())),
+    }
+}
+
 /// Assemble LIST rows from definition + repetition levels (native Array
 /// fields), following the standard parquet 3-level LIST mapping. Known
 /// limitation: with an OPTIONAL list group AND optional element, a list whose
@@ -1277,6 +1332,7 @@ fn list_cells(
     leaf: &parquet::SchemaLeaf,
     target: &TargetKind,
     field_name: &str,
+    text_lob: bool,
 ) -> Result<VecDeque<Cell>> {
     let Some(rep_levels) = &data.rep_levels else {
         return Err(Error::invalid_input(format!(
@@ -1324,7 +1380,13 @@ fn list_cells(
         let element_optional =
             data.max_def - 1 - u16::from(leaf.list_group_optional) == 1;
         if level == data.max_def {
-            current.push(value_cell(&data.values, value_index, element, field_name)?);
+            current.push(value_cell(
+                &data.values,
+                value_index,
+                element,
+                field_name,
+                text_lob,
+            )?);
             value_index += 1;
         } else if level == 0 {
             if !leaf.list_group_optional {
@@ -1650,6 +1712,8 @@ struct CollectionEntry {
     schema: Option<SchemaEntry>,
     /// Collection-level L0 segments (pure delta data).
     l0_segments: Option<Vec<SegmentEntry>>,
+    /// Snapshot-format backups only: where the exported bundle lives.
+    snapshot_backup: Option<crate::snapshot::SnapshotBackupInfo>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1680,16 +1744,16 @@ struct SegmentEntry {
 }
 
 #[derive(Deserialize)]
-struct FieldBinlog {
+pub(crate) struct FieldBinlog {
     #[serde(alias = "fieldID", alias = "field_id")]
-    field_id: Option<i64>,
+    pub(crate) field_id: Option<i64>,
     #[serde(default)]
-    binlogs: Vec<BinlogRef>,
+    pub(crate) binlogs: Vec<BinlogRef>,
 }
 
 #[derive(Deserialize)]
-struct BinlogRef {
-    log_path: Option<String>,
+pub(crate) struct BinlogRef {
+    pub(crate) log_path: Option<String>,
 }
 
 // --- helpers ----------------------------------------------------------------

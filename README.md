@@ -12,7 +12,8 @@ This repository was initialized from the experimental [duckdb/extension-template
 | 1 | `milvus_backups(root_path)` | ✅ Implemented | Backup inventory: one row per backup with flat scalar columns (name, id, milvus_version, created_at, size_bytes, collection_count, etc.). Accepts local paths and `s3://` URIs (through DuckDB's file system), reads only meta JSON, and never touches binlogs |
 | 2 | `milvus_backup_collections(root_path, backup_name)` | ✅ Implemented | One row per collection with identity (db/collection/id), timing (TSO + physical timestamp), shape (`fields` as `LIST(STRUCT)` with types/dim), volume (partition/segment counts, rows, size) and health (indexes, delete logs) columns; partition/segment entries without collection ids in old backups leave the affected columns NULL rather than zero |
 | 3 | `milvus_backup_scan(root_path, backup_name, collection)` | ✅ Implemented | Reads binlog rows with a built-in parquet reader (storage v1 envelopes and bare storage-v2 files), one segment per scan thread via `claim_batch`, projection pushdown, and delta-log tombstones applied by default. Vectors decode to fixed-size `FLOAT[dim]` arrays, sparse vectors to `STRUCT(indices, values)`; JSON fields stay VARCHAR and geometry/other vector kinds pass through as BLOB |
-| Future | Multi-collection scans (schema consistency checks), snapshot-format data scans, `milvus_backup_verify()` | 💡 | |
+| 4 | Snapshot-format backups | ✅ Implemented | `milvus_backup_scan` and `milvus_backup_collections` read snapshot-format backups (`format = "snapshot"`): the exported bundle's metadata JSON, per-segment avro manifests (OCF from format version 6, raw binary below), and milvus-storage packed parquet data files. `milvus_backups` already reports them. See the snapshot section below |
+| Future | Multi-collection scans (schema consistency checks), `milvus_backup_verify()` | 💡 | |
 
 Design principles: `SELECT *` should answer "Can this backup be trusted and used?". Information that cannot be determined from meta, such as the final row count or integrity, is represented as NULL or a boolean rather than a fabricated 0 or success status. Metadata functions perform only meta I/O and never scan binlogs.
 
@@ -133,7 +134,25 @@ SELECT id FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', 'messages')
 
 Named options: `apply_deletes` (default `true`) applies delta-log tombstones using Milvus's semantics (a row dies when a delete record for its primary key carries a strictly larger timestamp); `include_system` (default `false`) prepends `__row_id` (field 0) and `__timestamp` (the raw TSO, field 1).
 
-Collection names may be ambiguous across databases; qualify them as `db.collection` when needed. The scan supports local paths and `s3://` URIs (credentials come from httpfs). Snapshot-format backups (`format = "snapshot"`) carry no segment meta and are rejected with a clear error for now.
+Collection names may be ambiguous across databases; qualify them as `db.collection` when needed. The scan supports local paths and `s3://` URIs (credentials come from httpfs).
+
+### Snapshot-Format Backups
+
+Milvus 3.0 servers export backups as self-contained snapshot bundles instead of copied binlogs. All three metadata functions and the scan understand them; the entry point is the bundle's metadata JSON under `bundle/exports/<uuid>/snapshots/<collection>/metadata/`, whose per-segment avro manifests and milvus-storage manifests describe the packed data files.
+
+```sql
+-- Works like any backup; partition/segment counts come from the bundle.
+SELECT * FROM milvus_backup_collections('/mnt/backups', 'snap30');
+
+-- Rows read through the bundle's avro manifests and packed parquet files;
+-- L0 segments apply as tombstones exactly like the binlog format.
+SELECT count(*) FROM milvus_backup_scan('/mnt/backups', 'snap30', 'demo');
+```
+
+Two writer-side caveats:
+
+- Data files are the exact bytes the Milvus server wrote, so `milvus_backup_scan` needs them in parquet. That is the upstream Milvus default (`dataNode.storage.format = parquet`); clusters configured with `vortex` cannot be scanned — the error names the column-group format. TEXT fields stored through milvus-storage's LOB layer decode when inline and error on oversized LOB references.
+- Snapshot bundles with raw-binary manifests (bundle format version < 6) and version >= 6 OCF manifests are both supported. `milvus_backup_collections` reports bundle counts (partitions, segments) without reading the per-segment manifests, so `num_rows_inserted` and `has_delete_logs` stay NULL for them — scan the collection for real rows.
 
 ## Project Structure
 

@@ -1,0 +1,70 @@
+# name: test/sql/milvus_backup_snapshot.test
+# description: snapshot-format backups: bundle metadata, avro segment manifests, milvus-storage parquet data files, L0 tombstones
+# group: [milvus]
+
+statement error
+SELECT * FROM milvus_backup_scan('test/fixtures/snapshot', 'snap30', 'demo');
+----
+
+require milvus_backup
+
+# The fixture is a real snapshot-format backup exported by milvus-backup from
+# a Milvus v3.0.0 standalone: storage-v3 packed segments (parquet column
+# groups under bundle/exports/<uuid>/files/...), one L0 segment carrying five
+# delete tombstones. The bundle keys embed the writer's storage-root prefix
+# ("backup/"), which the bundle/exports/ anchor relocates away, so the
+# fixture can live at any root.
+
+query T
+SELECT format FROM milvus_backups('test/fixtures/snapshot')
+----
+snapshot
+
+query ITT
+SELECT partition_count, partition_names, has_delete_logs::INT FROM milvus_backup_collections('test/fixtures/snapshot', 'snap30')
+----
+2	[_default, p1]	NULL
+
+query I
+SELECT segment_count FROM milvus_backup_collections('test/fixtures/snapshot', 'snap30')
+----
+3
+
+query I
+SELECT count(*) FROM milvus_backup_scan('test/fixtures/snapshot', 'snap30', 'demo', apply_deletes = false)
+----
+200
+
+query I
+SELECT count(*) FROM milvus_backup_scan('test/fixtures/snapshot', 'snap30', 'demo')
+----
+195
+
+# The five L0 tombstones (ids 0-4) must be gone after delete filtering.
+query I
+SELECT count(*) FROM milvus_backup_scan('test/fixtures/snapshot', 'snap30', 'demo') WHERE id IN (0, 1, 2, 3, 4)
+----
+0
+
+query I
+SELECT count(*) FROM milvus_backup_scan('test/fixtures/snapshot', 'snap30', 'demo') WHERE id >= 1000
+----
+50
+
+# Row content: vec(i)[j] = ((i + j) % 13) / 10. (The runner only accepts
+# T/I/R header codes, so the float prints as VARCHAR.)
+query IIT
+SELECT id, name, vec[1]::VARCHAR FROM milvus_backup_scan('test/fixtures/snapshot', 'snap30', 'demo') ORDER BY id LIMIT 2
+----
+5	name_5	0.5
+6	name_6	0.6
+
+query I
+SELECT count(*) FROM milvus_backup_scan('test/fixtures/snapshot', 'snap30', 'demo', include_system = true) WHERE __row_id IS NOT NULL AND __timestamp IS NOT NULL
+----
+195
+
+query I
+SELECT count(vec) FROM milvus_backup_scan('test/fixtures/snapshot', 'snap30', 'demo') WHERE id = 7
+----
+1

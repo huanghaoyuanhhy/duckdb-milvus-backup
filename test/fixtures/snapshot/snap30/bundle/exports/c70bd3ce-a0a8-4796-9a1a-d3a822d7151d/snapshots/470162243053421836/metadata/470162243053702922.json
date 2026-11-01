@@ -1,0 +1,119 @@
+{
+  "format_version":  4,
+  "snapshot_info":  {
+    "name":  "mbk_snap30",
+    "id":  "470162243053702922",
+    "collection_id":  "470162243053421836",
+    "partition_ids":  [
+      "470162243053421837",
+      "470162243053421842"
+    ],
+    "create_ts":  "470162259598376972",
+    "s3_location":  "s3://mvb30/backup/snap30/bundle/exports/c70bd3ce-a0a8-4796-9a1a-d3a822d7151d/snapshots/470162243053421836/metadata/470162243053702922.json",
+    "state":  "SnapshotStatePending",
+    "pending_start_time":  "1793526687210",
+    "channel_seek_positions":  [
+      {
+        "channel_name":  "mvb30-rootcoord-dml_0_470162243053421836v0",
+        "msgID":  "CAEQGQ==",
+        "timestamp":  "470162259598376972",
+        "WAL_name":  "WoodPecker"
+      }
+    ]
+  },
+  "collection":  {
+    "schema":  {
+      "name":  "demo",
+      "fields":  [
+        {
+          "fieldID":  "100",
+          "name":  "id",
+          "is_primary_key":  true,
+          "data_type":  "Int64"
+        },
+        {
+          "fieldID":  "101",
+          "name":  "name",
+          "data_type":  "VarChar",
+          "type_params":  [
+            {
+              "key":  "max_length",
+              "value":  "64"
+            }
+          ]
+        },
+        {
+          "fieldID":  "102",
+          "name":  "vec",
+          "data_type":  "FloatVector",
+          "type_params":  [
+            {
+              "key":  "dim",
+              "value":  "8"
+            }
+          ]
+        },
+        {
+          "name":  "RowID",
+          "description":  "row id",
+          "data_type":  "Int64"
+        },
+        {
+          "fieldID":  "1",
+          "name":  "Timestamp",
+          "description":  "time stamp",
+          "data_type":  "Int64"
+        }
+      ],
+      "properties":  [
+        {
+          "key":  "timezone",
+          "value":  "UTC"
+        },
+        {
+          "key":  "namespace.sharding.enabled",
+          "value":  "false"
+        },
+        {
+          "key":  "max_field_id",
+          "value":  "102"
+        },
+        {
+          "key":  "consistency_level",
+          "value":  "2"
+        }
+      ],
+      "dbName":  "default"
+    },
+    "num_partitions":  "2",
+    "num_shards":  "1",
+    "partitions":  {
+      "_default":  "470162243053421837",
+      "p1":  "470162243053421842"
+    },
+    "virtual_channel_names":  [
+      "mvb30-rootcoord-dml_0_470162243053421836v0"
+    ]
+  },
+  "manifest_list":  [
+    "backup/snap30/bundle/exports/c70bd3ce-a0a8-4796-9a1a-d3a822d7151d/snapshots/470162243053421836/manifests/470162243053702922/470162243053622857.avro",
+    "backup/snap30/bundle/exports/c70bd3ce-a0a8-4796-9a1a-d3a822d7151d/snapshots/470162243053421836/manifests/470162243053702922/470162243053662874.avro",
+    "backup/snap30/bundle/exports/c70bd3ce-a0a8-4796-9a1a-d3a822d7151d/snapshots/470162243053421836/manifests/470162243053702922/470162243053621852.avro"
+  ],
+  "storagev2_manifest_list":  [
+    {
+      "segment_id":  "470162243053622857",
+      "manifest":  "{\"ver\":1,\"base_path\":\"backup/snap30/bundle/exports/c70bd3ce-a0a8-4796-9a1a-d3a822d7151d/files/insert_log/470162243053421836/470162243053421837/470162243053622857\"}"
+    },
+    {
+      "segment_id":  "470162243053662874",
+      "manifest":  "{\"ver\":1,\"base_path\":\"backup/snap30/bundle/exports/c70bd3ce-a0a8-4796-9a1a-d3a822d7151d/files/insert_log/470162243053421836/470162243053421842/470162243053662874\"}"
+    }
+  ],
+  "segment_ids":  [
+    "470162243053622857",
+    "470162243053662874",
+    "470162243053621852"
+  ],
+  "layout":  "SnapshotLayoutSelfContained"
+}
