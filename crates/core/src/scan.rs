@@ -97,13 +97,18 @@ impl ColumnSource {
 
 struct SegmentTask {
     segment_id: i64,
-    /// field id -> one candidate list per binlog file, in meta order.
-    fields: HashMap<i64, Vec<Vec<String>>>,
-    /// Files the meta does not attribute to one field: writers omit fieldID
-    /// when it is 0 (proto default), so RowID logs and storage-v2 multi-field
-    /// column groups land here. Their true contents are discovered by opening
-    /// them (envelope descriptor / parquet field ids).
-    unattributed: Vec<Vec<String>>,
+    /// Every insert-log file of the segment, in meta order. Milvus 2.6+
+    /// writes column-group ids (or nothing) into the meta's `fieldID`, so the
+    /// true field mapping is discovered by opening each file at task-cursor
+    /// build time (envelope descriptor / parquet field ids); `declared` is
+    /// only a fallback for footers without field-id annotations.
+    files: Vec<SegmentFile>,
+}
+
+struct SegmentFile {
+    candidates: Vec<String>,
+    /// fieldID the meta attributes this file to, when present.
+    declared: Option<i64>,
 }
 
 // --- duckdb-neo plumbing ----------------------------------------------------
@@ -366,27 +371,23 @@ fn bind_impl(
             collect_delta_candidates(segment, &mut delta_sources);
             continue;
         }
-        let mut task_fields: HashMap<i64, Vec<Vec<String>>> = HashMap::new();
-        let mut unattributed: Vec<Vec<String>> = Vec::new();
+        let mut files: Vec<SegmentFile> = Vec::new();
         for field_log in &segment.binlogs {
             for binlog_entry in &field_log.binlogs {
                 let Some(log_path) = &binlog_entry.log_path else { continue };
                 let candidates =
                     backup_log_paths(log_path, segment.group_id, segment.partition_id)?;
-                match field_log.field_id {
-                    Some(field_id) => {
-                        task_fields.entry(field_id).or_default().push(candidates);
-                    }
-                    None => unattributed.push(candidates),
-                }
+                files.push(SegmentFile {
+                    candidates,
+                    declared: field_log.field_id,
+                });
             }
         }
         collect_delta_candidates(segment, &mut delta_sources);
         estimated_rows += segment.num_of_rows.unwrap_or(0).max(0) as u64;
         tasks.push(SegmentTask {
             segment_id: segment.segment_id.unwrap_or(-1),
-            fields: task_fields,
-            unattributed,
+            files,
         });
     }
     for l0 in collection_l0 {
@@ -574,11 +575,11 @@ enum ColumnCursor {
 }
 
 impl ColumnCursor {
-    fn has_row(&mut self, fs: &FileSystem<'_>, dir: &str) -> Result<bool> {
+    fn has_row(&mut self) -> Result<bool> {
         match self {
             ColumnCursor::AllNull => Ok(false),
             ColumnCursor::Field(cursor) => {
-                cursor.ensure_loaded(fs, dir)?;
+                cursor.ensure_loaded()?;
                 Ok(cursor.has_row())
             }
         }
@@ -598,27 +599,28 @@ impl ColumnCursor {
     }
 }
 
-/// One unattributed file resolved at task-cursor build time, so every field
-/// cursor can pick up its share without reopening the file.
-struct ResolvedUnattributed {
+/// One insert-log file opened and resolved at task-cursor build time, so
+/// every field cursor can pick up its share without reopening the file.
+struct ResolvedFile {
     view: FileView,
     /// v1 envelope: the single field the file carries. Bare parquet: every
-    /// field id found in the footer.
+    /// field id found in the footer; when the footer carries no ids, the
+    /// meta-declared field.
     fields: UnattributedFields,
     path: String,
 }
 
+#[derive(Debug)]
 enum UnattributedFields {
     Single(i64),
     Bare(Vec<i64>),
 }
 
-/// Where a field cursor gets its next file from: either candidate paths to
-/// open on demand, or an already-opened view (unattributed files resolved
-/// once per task).
-enum FileSource {
-    Candidates { paths: Vec<String>, declared_field: Option<i64> },
-    Open { view: FileView, declared_field: Option<i64>, path: String },
+/// One already-opened insert-log file (resolved once per task, shared by the
+/// field cursors that it serves).
+struct FileSource {
+    view: FileView,
+    path: String,
 }
 
 struct FieldCursor {
@@ -639,10 +641,10 @@ impl FieldCursor {
     }
 
     /// Decode the next available chunk of rows into `cells`.
-    fn ensure_loaded(&mut self, fs: &FileSystem<'_>, dir: &str) -> Result<()> {
+    fn ensure_loaded(&mut self) -> Result<()> {
         while self.cells.is_empty() && !self.exhausted {
             if self.chunks.is_empty() {
-                self.open_next_file(fs, dir)?;
+                self.open_next_file()?;
             }
             while self.cells.is_empty() {
                 let Some((view, leaf, chunk)) = self.chunks.pop_front() else { break };
@@ -664,47 +666,22 @@ impl FieldCursor {
         Ok(())
     }
 
-    fn open_next_file(&mut self, fs: &FileSystem<'_>, dir: &str) -> Result<()> {
+    fn open_next_file(&mut self) -> Result<()> {
         while let Some(source) = self.files.pop_front() {
-            match source {
-                FileSource::Open { view, declared_field, path } => {
-                    if self.process_view(view, declared_field, &path)? {
-                        return Ok(());
-                    }
-                }
-                FileSource::Candidates { paths, declared_field } => {
-                    let (path, file) = open_first_candidate(fs, dir, &paths)?;
-                    let view = binlog::open_view(file)?;
-                    if self.process_view(view, declared_field, &path)? {
-                        return Ok(());
-                    }
-                }
+            if self.process_view(source.view, &source.path)? {
+                return Ok(());
             }
         }
         Ok(())
     }
 
-    /// Queue the chunks of `view` that serve this cursor's field. Returns
-    /// false when the file does not carry the field (normal for
-    /// unattributed files picked up by every field cursor).
-    fn process_view(
-        &mut self,
-        view: FileView,
-        declared_field: Option<i64>,
-        path: &str,
-    ) -> Result<bool> {
+    /// Queue the chunks of `view` that serve this cursor's field. The file's
+    /// served fields were resolved at task-cursor build time; this only
+    /// double-checks the envelope case, where the descriptor is authoritative.
+    fn process_view(&mut self, view: FileView, _path: &str) -> Result<bool> {
         match binlog::sniff(&view)? {
             BinlogKind::Envelope => {
                 let envelope = binlog::parse_envelope(&view)?;
-                if let Some(declared) = declared_field
-                    && declared != envelope.field_id
-                {
-                    return Err(Error::invalid_input(format!(
-                        "binlog {path} carries field {} but the meta assigns it to field \
-                         {} ({})",
-                        envelope.field_id, declared, self.field_name
-                    )));
-                }
                 if envelope.field_id != self.field_id {
                     return Ok(false);
                 }
@@ -803,7 +780,6 @@ fn exec_chunk(
         .map(|position| column_info.get_column_index(position))
         .collect::<Result<Vec<_>>>()?;
 
-    let fs = FileSystem::new(context)?;
     let mut rows = 0usize;
     loop {
         if rows == CHUNK_ROWS {
@@ -811,7 +787,7 @@ fn exec_chunk(
         }
         let mut any_row = false;
         for column in &mut cursor.columns {
-            if column.has_row(&fs, &bind_data.dir)? {
+            if column.has_row()? {
                 any_row = true;
             }
         }
@@ -947,24 +923,44 @@ fn build_task_cursor(
     filtering: bool,
 ) -> Result<TaskCursor> {
     let task = &bind_data.tasks[task_index];
-    // Open each unattributed file once so field cursors can share the views.
-    let mut unattributed: Vec<ResolvedUnattributed> = Vec::new();
-    for candidates in &task.unattributed {
-        let (path, file) = open_first_candidate(fs, dir, candidates)?;
-        let view = binlog::open_view(file)?;
+    // Open every insert-log file once and discover which fields it actually
+    // serves. The meta's fieldID cannot be trusted for this: Milvus 2.6
+    // column-group logs store the group id (or nothing) there, while the
+    // authoritative mapping lives in the parquet field-id annotations.
+    let mut resolved: Vec<ResolvedFile> = Vec::new();
+    for file in &task.files {
+        let (path, file_handle) = open_first_candidate(fs, dir, &file.candidates)?;
+        let view = binlog::open_view(file_handle)?;
         let fields = match binlog::sniff(&view)? {
             BinlogKind::Envelope => {
-                UnattributedFields::Single(binlog::parse_envelope(&view)?.field_id)
+                let envelope = binlog::parse_envelope(&view)?.field_id;
+                if let Some(declared) = file.declared
+                    && declared != envelope
+                {
+                    return Err(Error::invalid_input(format!(
+                        "binlog {path} carries field {envelope} but the meta assigns it to \
+                         field {declared}"
+                    )));
+                }
+                UnattributedFields::Single(envelope)
             }
-            BinlogKind::BareParquet => UnattributedFields::Bare(
-                parquet::read_footer(&view)?
-                    .leaves
-                    .iter()
-                    .filter_map(|leaf| leaf.field_id)
-                    .collect(),
-            ),
+            BinlogKind::BareParquet => {
+                let leaves = parquet::read_footer(&view)?.leaves;
+                let ids: Vec<i64> =
+                    leaves.iter().filter_map(|leaf| leaf.field_id).collect();
+                if ids.is_empty() {
+                    // Old writer: bare parquet without field-id annotations;
+                    // the meta attribution is all we have.
+                    match file.declared {
+                        Some(declared) => UnattributedFields::Single(declared),
+                        None => UnattributedFields::Bare(Vec::new()),
+                    }
+                } else {
+                    UnattributedFields::Bare(ids)
+                }
+            }
         };
-        unattributed.push(ResolvedUnattributed { view, fields, path });
+        resolved.push(ResolvedFile { view, fields, path });
     }
 
     let mut columns: Vec<ColumnCursor> = Vec::new();
@@ -976,7 +972,7 @@ fn build_task_cursor(
             columns.push(ColumnCursor::AllNull);
             continue;
         }
-        columns.push(build_column_cursor(task, &unattributed, column)?);
+        columns.push(build_column_cursor(&resolved, column)?);
     }
     if filtering {
         let pk_field_id = bind_data.pk_field_id.ok_or_else(|| {
@@ -1013,14 +1009,14 @@ fn build_task_cursor(
             source: ColumnSource::Timestamp,
             target: TargetKind::BigInt,
         };
-        let pk_cursor = build_column_cursor(task, &unattributed, &pk_column)?;
+        let pk_cursor = build_column_cursor(&resolved, &pk_column)?;
         if matches!(pk_cursor, ColumnCursor::AllNull) {
             return Err(Error::invalid_input(format!(
-                "segment {}: has delete logs to apply but no binlog for the primary key field",
+                "segment {}: primary key field {pk_field_id} has no binlog file",
                 task.segment_id
             )));
         }
-        let ts_cursor = build_column_cursor(task, &unattributed, &ts_column)?;
+        let ts_cursor = build_column_cursor(&resolved, &ts_column)?;
         if matches!(ts_cursor, ColumnCursor::AllNull) {
             return Err(Error::invalid_input(format!(
                 "segment {}: has delete logs to apply but no timestamp log (field 1)",
@@ -1040,34 +1036,23 @@ fn build_task_cursor(
 }
 
 fn build_column_cursor(
-    task: &SegmentTask,
-    unattributed: &[ResolvedUnattributed],
+    resolved: &[ResolvedFile],
     column: &OutputColumn,
 ) -> Result<ColumnCursor> {
     let field_id = column.source.field_id();
-    // Attributed files first (meta order), then unattributed files whose
-    // contents match this field. Both empty => the field has no data in this
-    // segment (schema evolution): every row is NULL.
-    let mut files: VecDeque<FileSource> = task
-        .fields
-        .get(&field_id)
-        .into_iter()
-        .flatten()
-        .map(|paths| FileSource::Candidates {
-            paths: paths.clone(),
-            declared_field: Some(field_id),
-        })
-        .collect();
-    for resolved in unattributed {
-        let serves = match &resolved.fields {
+    // Files whose discovered contents serve this field, in meta order. Empty
+    // => the field has no data in this segment (schema evolution): every row
+    // is NULL.
+    let mut files: VecDeque<FileSource> = VecDeque::new();
+    for file in resolved {
+        let serves = match &file.fields {
             UnattributedFields::Single(single) => *single == field_id,
             UnattributedFields::Bare(fields) => fields.contains(&field_id),
         };
         if serves {
-            files.push_back(FileSource::Open {
-                view: resolved.view.clone(),
-                declared_field: None,
-                path: resolved.path.clone(),
+            files.push_back(FileSource {
+                view: file.view.clone(),
+                path: file.path.clone(),
             });
         }
     }
