@@ -135,6 +135,26 @@ pub(crate) struct ParquetMeta {
     /// pin the expected writer generation.
     #[allow(dead_code)]
     pub(crate) created_by: Option<String>,
+    /// Footer key-value metadata, in file order. milvus-storage packed files
+    /// carry their field-id mapping here (`group_field_id_list`).
+    pub(crate) key_value: Vec<(String, String)>,
+}
+
+/// Parse milvus-storage's `group_field_id_list` footer entry: `;`-separated
+/// groups, one per parquet leaf column in schema order, each a `,`-separated
+/// list of Milvus field ids (outer arrow field first for nested types). See
+/// milvus-storage `cpp/src/common/metadata.cpp` (GroupFieldIDList).
+pub(crate) fn group_field_ids(key_value: &[(String, String)], leaf_count: usize) -> Option<Vec<i64>> {
+    let value = key_value
+        .iter()
+        .find(|(key, _)| key == "group_field_id_list")
+        .map(|(_, value)| value)?;
+    let mut ids = Vec::with_capacity(leaf_count);
+    for group in value.split(';') {
+        let first = group.split(',').next()?;
+        ids.push(first.parse::<i64>().ok()?);
+    }
+    (ids.len() == leaf_count).then_some(ids)
 }
 
 /// Read and parse the footer of a parquet file (or of an embedded payload
@@ -171,6 +191,7 @@ fn parse_file_metadata(data: &[u8]) -> Result<ParquetMeta> {
 
     let mut raw_schema: Vec<RawSchemaElement> = Vec::new();
     let mut created_by: Option<String> = None;
+    let mut key_value: Vec<(String, String)> = Vec::new();
 
     while let Ok((field_id, field_type)) = reader.field_header() {
         if field_type == super::thrift::T_STOP {
@@ -178,6 +199,7 @@ fn parse_file_metadata(data: &[u8]) -> Result<ParquetMeta> {
         }
         match (field_id, field_type) {
             (2, T_LIST) => parse_element_list(&mut reader, &mut raw_schema)?,
+            (5, T_LIST) => parse_key_value_metadata(&mut reader, &mut key_value)?,
             (6, T_BINARY) => created_by = Some(String::from_utf8_lossy(reader.binary()?).into_owned()),
             _ => reader.skip(field_type)?,
         }
@@ -216,7 +238,38 @@ fn parse_file_metadata(data: &[u8]) -> Result<ParquetMeta> {
         leaves,
         row_groups,
         created_by,
+        key_value,
     })
+}
+
+/// parquet `KeyValue` list: structs of `1: string key, 2: string value`.
+fn parse_key_value_metadata(
+    reader: &mut ThriftReader<'_>,
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
+    let (element_type, size) = reader.list_header()?;
+    if element_type != T_STRUCT {
+        return Err(Error::invalid_input("key-value metadata is not a struct list"));
+    }
+    for _ in 0..size {
+        reader.enter_struct();
+        let mut key: Option<String> = None;
+        let mut value = String::new();
+        while let Ok((field_id, field_type)) = reader.field_header() {
+            if field_type == super::thrift::T_STOP {
+                break;
+            }
+            match (field_id, field_type) {
+                (1, T_BINARY) => key = Some(String::from_utf8_lossy(reader.binary()?).into_owned()),
+                (2, T_BINARY) => value = String::from_utf8_lossy(reader.binary()?).into_owned(),
+                _ => reader.skip(field_type)?,
+            }
+        }
+        if let Some(key) = key {
+            out.push((key, value));
+        }
+    }
+    Ok(())
 }
 
 fn parse_element_list(

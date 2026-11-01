@@ -605,8 +605,14 @@ struct ResolvedFile {
     view: FileView,
     /// v1 envelope: the single field the file carries. Bare parquet: every
     /// field id found in the footer; when the footer carries no ids, the
+    /// milvus-storage `group_field_id_list` footer entry, or failing both the
     /// meta-declared field.
     fields: UnattributedFields,
+    /// For bare parquet attributed through footer key-value metadata: leaf
+    /// column index per field id. Footer annotations make this unnecessary
+    /// (process_view re-derives the leaf from the annotation), and envelopes
+    /// carry a single payload leaf.
+    leaf_by_field: Option<HashMap<i64, usize>>,
     path: String,
 }
 
@@ -621,6 +627,9 @@ enum UnattributedFields {
 struct FileSource {
     view: FileView,
     path: String,
+    /// Leaf column fixed by key-value attribution; `None` lets process_view
+    /// match the footer annotations.
+    forced_leaf: Option<usize>,
 }
 
 struct FieldCursor {
@@ -668,7 +677,7 @@ impl FieldCursor {
 
     fn open_next_file(&mut self) -> Result<()> {
         while let Some(source) = self.files.pop_front() {
-            if self.process_view(source.view, &source.path)? {
+            if self.process_view(source.view, source.forced_leaf, &source.path)? {
                 return Ok(());
             }
         }
@@ -678,7 +687,7 @@ impl FieldCursor {
     /// Queue the chunks of `view` that serve this cursor's field. The file's
     /// served fields were resolved at task-cursor build time; this only
     /// double-checks the envelope case, where the descriptor is authoritative.
-    fn process_view(&mut self, view: FileView, _path: &str) -> Result<bool> {
+    fn process_view(&mut self, view: FileView, forced_leaf: Option<usize>, _path: &str) -> Result<bool> {
         match binlog::sniff(&view)? {
             BinlogKind::Envelope => {
                 let envelope = binlog::parse_envelope(&view)?;
@@ -700,11 +709,23 @@ impl FieldCursor {
             }
             BinlogKind::BareParquet => {
                 let meta = parquet::read_footer(&view)?;
-                let Some(leaf_index) = meta
-                    .leaves
-                    .iter()
-                    .position(|leaf| leaf.field_id == Some(self.field_id))
-                else {
+                let leaf_index = match forced_leaf {
+                    Some(index) => {
+                        if index >= meta.leaves.len() {
+                            return Err(Error::invalid_input(format!(
+                                "key-value field attribution points at leaf {index} but the \
+                                 file has {} leaves",
+                                meta.leaves.len()
+                            )));
+                        }
+                        Some(index)
+                    }
+                    None => meta
+                        .leaves
+                        .iter()
+                        .position(|leaf| leaf.field_id == Some(self.field_id)),
+                };
+                let Some(leaf_index) = leaf_index else {
                     // Storage-v2 column groups: a field lives in exactly one
                     // group file; absence here is normal.
                     return Ok(false);
@@ -931,6 +952,7 @@ fn build_task_cursor(
     for file in &task.files {
         let (path, file_handle) = open_first_candidate(fs, dir, &file.candidates)?;
         let view = binlog::open_view(file_handle)?;
+        let mut leaf_by_field: Option<HashMap<i64, usize>> = None;
         let fields = match binlog::sniff(&view)? {
             BinlogKind::Envelope => {
                 let envelope = binlog::parse_envelope(&view)?.field_id;
@@ -945,22 +967,36 @@ fn build_task_cursor(
                 UnattributedFields::Single(envelope)
             }
             BinlogKind::BareParquet => {
-                let leaves = parquet::read_footer(&view)?.leaves;
+                let meta = parquet::read_footer(&view)?;
                 let ids: Vec<i64> =
-                    leaves.iter().filter_map(|leaf| leaf.field_id).collect();
+                    meta.leaves.iter().filter_map(|leaf| leaf.field_id).collect();
                 if ids.is_empty() {
-                    // Old writer: bare parquet without field-id annotations;
-                    // the meta attribution is all we have.
-                    match file.declared {
-                        Some(declared) => UnattributedFields::Single(declared),
-                        None => UnattributedFields::Bare(Vec::new()),
+                    // No thrift field-id annotations: milvus-storage packed
+                    // files record the mapping in footer key-value metadata
+                    // (one group per leaf column), older bare-parquet writers
+                    // leave only the meta-declared field.
+                    let kv_ids = parquet::group_field_ids(&meta.key_value, meta.leaves.len());
+                    if let Some(kv_ids) = kv_ids {
+                        leaf_by_field = Some(
+                            kv_ids
+                                .iter()
+                                .enumerate()
+                                .map(|(leaf, field)| (*field, leaf))
+                                .collect(),
+                        );
+                        UnattributedFields::Bare(kv_ids)
+                    } else {
+                        match file.declared {
+                            Some(declared) => UnattributedFields::Single(declared),
+                            None => UnattributedFields::Bare(Vec::new()),
+                        }
                     }
                 } else {
                     UnattributedFields::Bare(ids)
                 }
             }
         };
-        resolved.push(ResolvedFile { view, fields, path });
+        resolved.push(ResolvedFile { view, fields, leaf_by_field, path });
     }
 
     let mut columns: Vec<ColumnCursor> = Vec::new();
@@ -1053,6 +1089,11 @@ fn build_column_cursor(
             files.push_back(FileSource {
                 view: file.view.clone(),
                 path: file.path.clone(),
+                forced_leaf: file
+                    .leaf_by_field
+                    .as_ref()
+                    .and_then(|map| map.get(&field_id))
+                    .copied(),
             });
         }
     }

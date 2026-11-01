@@ -24,7 +24,7 @@ use std::sync::Arc;
 use duckdb_neo::{Error, Result, file::File};
 
 pub(crate) use decode::{ChunkReader, ColumnData, Values, read_chunk};
-pub(crate) use footer::{ColumnChunkMeta, PhysicalType, SchemaLeaf, read_footer};
+pub(crate) use footer::{ColumnChunkMeta, PhysicalType, SchemaLeaf, group_field_ids, read_footer};
 
 /// Underlying byte source of a scan region. `Mem` backs the unit tests.
 #[allow(dead_code)]
