@@ -1,7 +1,10 @@
 //! `milvus_backup_scan(root_path, backup_name, collection)` — read the rows
 //! of one collection straight out of a Milvus backup.
 //!
-//! Bind reads only the meta JSON (same helpers as the other functions),
+//! Two overloads share one execution path: the three-key form locates the
+//! backup as `{root_path}/{backup_name}`, the two-key form
+//! `(path, collection)` takes the backup directory itself. Bind reads only
+//! the meta JSON (same helpers as the other functions),
 //! resolves the collection's segments, and declares the output schema from
 //! the collection schema. Execution claims one segment per batch (claim_batch
 //! + a shared task counter), opens only the binlog files of projected columns
@@ -46,6 +49,9 @@ use crate::schema::{self, MilvusField, TargetKind};
 use crate::tombstone::{Pk, Tombstones};
 
 pub(crate) struct ScanFunction;
+
+/// Two-argument overload: the path is the backup directory itself.
+pub(crate) struct ScanAtPathFunction;
 
 /// Maximum rows produced per exec call; matches DuckDB's standard vector
 /// size, keeping output chunks aligned with the engine's expectations.
@@ -140,70 +146,92 @@ impl TableFunctionCallbacks for ScanFunction {
     ) -> Result<Self::BindData> {
         let root = normalize_root(constant_string(&arguments, 0, "root_path")?);
         let backup_name = constant_string(&arguments, 1, "backup_name")?;
-        let collection = constant_string(&arguments, 2, "collection")?;
-        let apply_deletes = optional_bool(&arguments, 3, "apply_deletes", true)?;
-        let include_system = optional_bool(&arguments, 4, "include_system", false)?;
         let dir = backup_dir(&root, &backup_name)?;
-        bind_impl(
-            context,
-            &dir,
-            &collection,
-            apply_deletes,
-            include_system,
-            bind_handle,
-        )
+        bind_after_dir(context, &arguments, &dir, 2, bind_handle)
     }
 
     fn init_global_state(
         &self,
         bind_data: &Self::BindData,
         context: &Context,
-        _column_data: InitColumnData<'_>,
+        column_data: InitColumnData<'_>,
     ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
-        let tombstones = OnceLock::new();
-        if bind_data.apply_deletes && !bind_data.delta_sources.is_empty() {
-            let built = build_tombstones(context, &bind_data.dir, &bind_data.delta_sources)?;
-            tombstones
-                .set(built)
-                .map_err(|_| Error::api_error("tombstones already built"))?;
-        }
-        let global = GlobalState {
-            next_task: AtomicUsize::new(0),
-            rows_done: AtomicU64::new(0),
-            estimated_rows: bind_data.estimated_rows,
-            tombstones,
-        };
-        let threads = (!bind_data.tasks.is_empty()).then(|| bind_data.tasks.len());
-        Ok((Some(global), threads))
+        init_global_state(bind_data, context, column_data)
     }
 
     fn init_local_state(
         &self,
-        _bind_data: &Self::BindData,
-        _global_state: Option<&Self::GlobalState>,
-        _context: &Context,
-        _column_data: InitColumnData<'_>,
+        bind_data: &Self::BindData,
+        global_state: Option<&Self::GlobalState>,
+        context: &Context,
+        column_data: InitColumnData<'_>,
     ) -> Result<Option<Self::LocalState>> {
-        Ok(Some(LocalState {
-            task_index: None,
-            cursor: None,
-        }))
+        init_local_state(bind_data, global_state, context, column_data)
     }
 
     fn progress(
         &self,
-        _bind_data: &Self::BindData,
+        bind_data: &Self::BindData,
         global_state: Option<&Self::GlobalState>,
-        _context: &Context,
+        context: &Context,
     ) -> Result<Option<f64>> {
-        let Some(global) = global_state else {
-            return Ok(None);
-        };
-        if global.estimated_rows == 0 {
-            return Ok(None);
-        }
-        let done = global.rows_done.load(Ordering::SeqCst);
-        Ok(Some((done as f64 / global.estimated_rows as f64).min(1.0)))
+        progress_report(bind_data, global_state, context)
+    }
+
+    fn exec(
+        &self,
+        bind_data: &Self::BindData,
+        global_state: Option<&Self::GlobalState>,
+        local_state: Option<&mut Self::LocalState>,
+        context: &Context,
+        output: DataChunkRef<'_>,
+        column_info: ExecColumnInfo<'_>,
+    ) -> Result<()> {
+        exec_chunk(bind_data, global_state, local_state, context, output, column_info)
+    }
+}
+
+impl TableFunctionCallbacks for ScanAtPathFunction {
+    type BindData = BindData;
+    type GlobalState = GlobalState;
+    type LocalState = LocalState;
+
+    fn bind(
+        &self,
+        context: &Context,
+        arguments: Vec<BindArgument>,
+        bind_handle: BindFunctionHandle<'_>,
+    ) -> Result<Self::BindData> {
+        let path = normalize_root(constant_string(&arguments, 0, "path")?);
+        bind_after_dir(context, &arguments, &path, 1, bind_handle)
+    }
+
+    fn init_global_state(
+        &self,
+        bind_data: &Self::BindData,
+        context: &Context,
+        column_data: InitColumnData<'_>,
+    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
+        init_global_state(bind_data, context, column_data)
+    }
+
+    fn init_local_state(
+        &self,
+        bind_data: &Self::BindData,
+        global_state: Option<&Self::GlobalState>,
+        context: &Context,
+        column_data: InitColumnData<'_>,
+    ) -> Result<Option<Self::LocalState>> {
+        init_local_state(bind_data, global_state, context, column_data)
+    }
+
+    fn progress(
+        &self,
+        bind_data: &Self::BindData,
+        global_state: Option<&Self::GlobalState>,
+        context: &Context,
+    ) -> Result<Option<f64>> {
+        progress_report(bind_data, global_state, context)
     }
 
     fn exec(
@@ -225,30 +253,129 @@ impl TableClaimBatchCallbacks for ScanFunction {
         bind_data: &Self::BindData,
         global_state: Option<&Self::GlobalState>,
         local_state: Option<&mut Self::LocalState>,
-        _context: &Context,
+        context: &Context,
     ) -> Result<bool> {
-        let Some(local) = local_state else {
-            return Err(Error::api_error("scan local state missing"));
-        };
-        let Some(global) = global_state else {
-            return Err(Error::api_error("scan global state missing"));
-        };
-        // claim_batch runs before a thread's first exec and after every exec
-        // that produced zero rows (task finished) — each call advances to the
-        // next task. File opening happens lazily in exec so this callback
-        // never blocks other threads on I/O.
-        let claimed = global.next_task.fetch_add(1, Ordering::SeqCst);
-        if claimed >= bind_data.tasks.len() {
-            local.task_index = None;
-            return Ok(false);
-        }
-        local.task_index = Some(claimed);
-        local.cursor = None;
-        Ok(true)
+        claim_batch(bind_data, global_state, local_state, context)
     }
 }
 
+impl TableClaimBatchCallbacks for ScanAtPathFunction {
+    fn claim_batch(
+        &self,
+        bind_data: &Self::BindData,
+        global_state: Option<&Self::GlobalState>,
+        local_state: Option<&mut Self::LocalState>,
+        context: &Context,
+    ) -> Result<bool> {
+        claim_batch(bind_data, global_state, local_state, context)
+    }
+}
+
+// --- shared callbacks -------------------------------------------------------
+
+/// Shared init for both overloads: tombstones are built once per scan, so
+/// exec only reads the ready map.
+fn init_global_state(
+    bind_data: &BindData,
+    context: &Context,
+    _column_data: InitColumnData<'_>,
+) -> Result<(Option<GlobalState>, Option<usize>)> {
+    let tombstones = OnceLock::new();
+    if bind_data.apply_deletes && !bind_data.delta_sources.is_empty() {
+        let built = build_tombstones(context, &bind_data.dir, &bind_data.delta_sources)?;
+        tombstones
+            .set(built)
+            .map_err(|_| Error::api_error("tombstones already built"))?;
+    }
+    let global = GlobalState {
+        next_task: AtomicUsize::new(0),
+        rows_done: AtomicU64::new(0),
+        estimated_rows: bind_data.estimated_rows,
+        tombstones,
+    };
+    let threads = (!bind_data.tasks.is_empty()).then(|| bind_data.tasks.len());
+    Ok((Some(global), threads))
+}
+
+/// Shared local-state init for both overloads.
+fn init_local_state(
+    _bind_data: &BindData,
+    _global_state: Option<&GlobalState>,
+    _context: &Context,
+    _column_data: InitColumnData<'_>,
+) -> Result<Option<LocalState>> {
+    Ok(Some(LocalState {
+        task_index: None,
+        cursor: None,
+    }))
+}
+
+/// Shared progress for both overloads.
+fn progress_report(
+    _bind_data: &BindData,
+    global_state: Option<&GlobalState>,
+    _context: &Context,
+) -> Result<Option<f64>> {
+    let Some(global) = global_state else {
+        return Ok(None);
+    };
+    if global.estimated_rows == 0 {
+        return Ok(None);
+    }
+    let done = global.rows_done.load(Ordering::SeqCst);
+    Ok(Some((done as f64 / global.estimated_rows as f64).min(1.0)))
+}
+
+/// Shared task claiming for both overloads: claim_batch runs before a
+/// thread's first exec and after every exec that produced zero rows (task
+/// finished) — each call advances to the next task. File opening happens
+/// lazily in exec so this callback never blocks other threads on I/O.
+fn claim_batch(
+    bind_data: &BindData,
+    global_state: Option<&GlobalState>,
+    local_state: Option<&mut LocalState>,
+    _context: &Context,
+) -> Result<bool> {
+    let Some(local) = local_state else {
+        return Err(Error::api_error("scan local state missing"));
+    };
+    let Some(global) = global_state else {
+        return Err(Error::api_error("scan global state missing"));
+    };
+    let claimed = global.next_task.fetch_add(1, Ordering::SeqCst);
+    if claimed >= bind_data.tasks.len() {
+        local.task_index = None;
+        return Ok(false);
+    }
+    local.task_index = Some(claimed);
+    local.cursor = None;
+    Ok(true)
+}
+
 // --- bind -------------------------------------------------------------------
+
+/// Shared bind tail for both overloads: everything after the backup
+/// directory is known. `collection` and the named options sit two slots
+/// earlier in the two-argument (path) form.
+fn bind_after_dir(
+    context: &Context,
+    arguments: &[BindArgument],
+    dir: &str,
+    collection_index: usize,
+    bind_handle: BindFunctionHandle<'_>,
+) -> Result<BindData> {
+    let collection = constant_string(arguments, collection_index, "collection")?;
+    let apply_deletes = optional_bool(arguments, collection_index + 1, "apply_deletes", true)?;
+    let include_system = optional_bool(arguments, collection_index + 2, "include_system", false)?;
+    bind_impl(
+        context,
+        dir,
+        &collection,
+        apply_deletes,
+        include_system,
+        bind_handle,
+    )
+}
 
 fn bind_impl(
     context: &Context,
@@ -264,7 +391,8 @@ fn bind_impl(
     if !fs.exists(&backup_meta_path)? {
         return Err(Error::invalid_input(format!(
             "backup not found: {dir}; expected a backup directory containing \
-             meta/backup_meta.json"
+             meta/backup_meta.json, or use milvus_backup_scan(root_path, backup_name, \
+             collection)"
         )));
     }
     let backup_meta: BackupMeta =
@@ -1815,6 +1943,44 @@ pub(crate) fn register(extension: &Extension) -> Result<()> {
                     ),
             ),
         ScanFunction,
+    )
+    .with_projection_pushdown(true)
+    .with_claim_batch()
+    .with_progress()
+    .register(extension)?;
+
+    // Overload: address the backup directory directly, without naming a root.
+    TableFunctionBuilder::new(
+        "milvus_backup_scan",
+        SignatureBuilder::new()
+            .param(FunctionParameter::new::<String>("path"))
+            .param(FunctionParameter::new::<String>("collection"))
+            .param(
+                FunctionParameter::with_default::<bool>("apply_deletes", true)
+                    .kind(FunctionParameterKind::Named),
+            )
+            .param(
+                FunctionParameter::with_default::<bool>("include_system", false)
+                    .kind(FunctionParameterKind::Named),
+            )
+            .documentation(
+                FunctionDocumentationBuilder::new()
+                    .add_category("milvus")
+                    .description(
+                        "Read the rows of one collection inside the Milvus backup directory \
+                         given by path (the directory containing meta/backup_meta.json). \
+                         Delta-log tombstones are applied by default (pass apply_deletes = \
+                         false to see raw inserted rows); vector columns decode to FLOAT[dim] \
+                         arrays and sparse vectors to STRUCT(indices, values). Reads binlog \
+                         data, so it touches every matching file.",
+                    )
+                    .add_example(
+                        "scan a collection of a backup directory",
+                        "SELECT * FROM milvus_backup_scan('/mnt/milvus-backup/backup_20260101', \
+                         'messages')",
+                    ),
+            ),
+        ScanAtPathFunction,
     )
     .with_projection_pushdown(true)
     .with_claim_batch()

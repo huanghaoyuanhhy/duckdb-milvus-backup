@@ -241,7 +241,7 @@ One row per collection inside a single backup. Unlike `milvus_backups`, an unkno
 
 ### `milvus_backup_scan(root_path, backup_name, collection)`
 
-Reads the data files of one collection and returns one column per schema field, named by field name. Named options:
+Reads the data files of one collection and returns one column per schema field, named by field name. A two-argument overload `milvus_backup_scan(path, collection)` takes the backup directory itself. Named options:
 
 | Parameter | Default | Description |
 |---|---|---|
