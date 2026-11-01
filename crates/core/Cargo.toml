@@ -7,3 +7,7 @@ edition.workspace = true
 duckdb-neo.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Milvus binlog payloads are ZSTD (parquet-go writer) or uncompressed; SNAPPY
+# covers arrow-written storage-v2 files. Decode-only, small crates.
+snap = "1"
+zstd = "0.13"
