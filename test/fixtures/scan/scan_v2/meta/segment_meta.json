@@ -1,0 +1,1 @@
+{"infos":[{"segment_id":201,"collection_id":2,"partition_id":20,"num_of_rows":4,"storage_version":2,"binlogs":[{"binlogs":[{"log_path":"files/insert_log/2/20/201/0/2001"}]}],"deltalogs":[{}]}]}
