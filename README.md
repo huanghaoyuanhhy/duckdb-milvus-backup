@@ -10,7 +10,7 @@ This repository was initialized from the experimental [duckdb/extension-template
 |---|---|---|---|
 | 0 | `milvus_backup_version()` | ✅ Implemented | Returns the extension version embedded at compile time; also validates the end-to-end build/load/test pipeline |
 | 1 | `milvus_backups(root_path)` | ✅ Implemented | Backup inventory: one row per backup with flat scalar columns (name, id, milvus_version, created_at, size_bytes, collection_count, etc.). Accepts local paths and `s3://` URIs (through DuckDB's file system), reads only meta JSON, and never touches binlogs |
-| 2 | `milvus_backup_collections(root_path, backup_name)` | 🚧 Planned | One row per collection for WHERE/ORDER BY/JOIN; secondary details such as schemas are returned only through explicitly selected columns |
+| 2 | `milvus_backup_collections(root_path, backup_name)` | ✅ Implemented | One row per collection with identity (db/collection/id), timing (TSO + physical timestamp), shape (`fields` as `LIST(STRUCT)` with types/dim), volume (partition/segment counts, rows, size) and health (indexes, delete logs) columns; partition/segment entries without collection ids in old backups leave the affected columns NULL rather than zero |
 | 3 | `milvus_backup_scan(root_path, backup_name, collection)` | 🚧 Planned | Scans binlog data with per-file parallelism via `claim_batch`, projection/filter pushdown, and vector columns represented as fixed-size `FLOAT[dim]` arrays |
 | Future | Multi-collection scans (schema consistency checks), `milvus_backup_verify()` | 💡 | |
 
@@ -87,10 +87,20 @@ FROM milvus_backups('/mnt/backups');
 
 `root_path` can also point to object storage through DuckDB's file system — load `httpfs`, set up credentials (`CREATE SECRET`), then pass an `s3://` URI. Columns that a backup's meta does not carry (for example `has_rbac` on older backups, or `num_rows_inserted` on snapshot backups) are NULL, never a fabricated value.
 
+Drill into one backup — one row per collection, with schema fields and indexes as `LIST(STRUCT)` columns. Address it by root plus name, or pass the backup directory itself:
+
+```sql
+SELECT collection_name, db_name, num_rows_inserted, partition_names,
+       fields[1].name AS pk_field, fields[2].dim AS vector_dim
+FROM milvus_backup_collections('/mnt/backups', 'backup_20261027');
+
+SELECT collection_name, num_rows_inserted
+FROM milvus_backup_collections('/mnt/backups/backup_20261027');
+```
+
 The following interfaces are planned and have not been implemented yet:
 
 ```sql
-SELECT * FROM milvus_backup_collections('/mnt/backups', 'backup_20261027');
 SELECT * FROM milvus_backup_scan('/mnt/backups', 'backup_20261027', collection = 'messages');
 ```
 

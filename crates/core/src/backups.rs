@@ -13,12 +13,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::Deserialize;
 
 use duckdb_neo::{
-    DuckDBType, Error, Result,
+    DuckDBType, Result,
     bind_arguments::BindArgument,
     connection::Context,
     data_chunk::DataChunkRef,
     extension::Extension,
-    file::{FileBuilder, FileSystem},
+    file::FileSystem,
     signature::{FunctionDocumentationBuilder, FunctionParameter, SignatureBuilder},
     table_function::{
         BindFunctionHandle, ExecColumnInfo, InitColumnData, OrderPreservation,
@@ -26,6 +26,8 @@ use duckdb_neo::{
     },
     types::{List, TimestampTzValue},
 };
+
+use crate::meta::{constant_string, normalize_root, parse_json, read_infos, read_required};
 
 pub(crate) struct BackupsFunction;
 
@@ -55,10 +57,7 @@ impl TableFunctionCallbacks for BackupsFunction {
         arguments: Vec<BindArgument>,
         bind_handle: BindFunctionHandle<'_>,
     ) -> Result<Self::BindData> {
-        let root = constant_string(&arguments, "root_path")?;
-        // A trailing slash must not produce `//` in the glob pattern; keep "/" itself usable.
-        let root = root.trim_end_matches('/');
-        let root = if root.is_empty() { "/" } else { root };
+        let root = normalize_root(constant_string(&arguments, 0, "root_path")?);
 
         let fs = FileSystem::new(context)?;
         // The v2 C API offers no directory listing, only glob — this is the
@@ -267,7 +266,8 @@ impl BackupRow {
         // different databases stay distinguishable; db_name is absent in old
         // backups, where the bare collection name is all that exists.
         let collection_names = colls.as_ref().map(|colls| {
-            colls.iter()
+            colls
+                .iter()
                 .filter_map(|coll| match (&coll.db_name, &coll.collection_name) {
                     (Some(db), Some(name)) if !db.is_empty() => Some(format!("{db}.{name}")),
                     (_, Some(name)) => Some(name.clone()),
@@ -382,11 +382,6 @@ struct RbacMeta {
 }
 
 #[derive(Deserialize)]
-struct LevelFile<T> {
-    infos: Option<Vec<T>>,
-}
-
-#[derive(Deserialize)]
 struct CollectionBackup {
     collection_name: Option<String>,
     db_name: Option<String>,
@@ -409,51 +404,6 @@ struct SegmentBackup {
 struct DeltaLog {
     #[serde(default)]
     binlogs: Vec<serde_json::Value>,
-}
-
-fn read_required(fs: &FileSystem, path: &str) -> Result<Vec<u8>> {
-    read_optional(fs, path)?.ok_or_else(|| Error::invalid_input(format!("file not found: {path}")))
-}
-
-fn read_optional(fs: &FileSystem, path: &str) -> Result<Option<Vec<u8>>> {
-    if !fs.exists(path)? {
-        return Ok(None);
-    }
-    let file = FileBuilder::new(fs, path)?.read().open()?;
-    let size = file.size()? as usize;
-    Ok(Some(file.read_at(0, size)?))
-}
-
-fn read_infos<T: serde::de::DeserializeOwned>(
-    fs: &FileSystem,
-    dir: &str,
-    level: &str,
-) -> Result<Option<Vec<T>>> {
-    let path = format!("{dir}/meta/{level}.json");
-    read_optional(fs, &path)?
-        .map(|bytes| {
-            parse_json(&bytes, &path).map(|level: LevelFile<T>| level.infos.unwrap_or_default())
-        })
-        .transpose()
-}
-
-fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8], path: &str) -> Result<T> {
-    serde_json::from_slice(bytes)
-        .map_err(|error| Error::invalid_input(format!("failed to parse {path}: {error}")))
-}
-
-fn constant_string(arguments: &[BindArgument], name: &str) -> Result<String> {
-    let argument = arguments
-        .first()
-        .ok_or_else(|| Error::invalid_parameter(format!("{name} is required")))?;
-    let value = argument.value.as_ref().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "{name} must be a constant string, e.g. milvus_backups('/mnt/backups')"
-        ))
-    })?;
-    value
-        .get::<String>()?
-        .ok_or_else(|| Error::invalid_input(format!("{name} must not be NULL")))
 }
 
 pub(crate) fn register(extension: &Extension) -> Result<()> {

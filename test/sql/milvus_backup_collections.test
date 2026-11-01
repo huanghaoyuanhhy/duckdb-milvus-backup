@@ -1,0 +1,122 @@
+# name: test/sql/milvus_backup_collections.test
+# description: milvus_backup_collections(root_path, backup_name) lists one row per collection inside a single backup
+# group: [milvus]
+
+# Before we load the extension, this will fail
+statement error
+SELECT * FROM milvus_backup_collections('test/fixtures/backups', 'alpha');
+----
+
+require milvus_backup
+
+# The fixtures are the hand-written minimal backups shared with
+# milvus_backups.test: alpha is an old-style binlog backup whose partition and
+# segment entries carry no collection ids, beta a modern one with full
+# linkage, schema, index info and an l0 segment, gamma a snapshot backup (no
+# partition/segment files at all), and clean a modern backup with full
+# linkage and no delete records.
+
+# Two-key addressing: the backup name locates exactly one directory, so an
+# unknown name is an error, unlike the glob-based milvus_backups.
+statement error
+SELECT * FROM milvus_backup_collections('test/fixtures/backups', 'missing-backup');
+----
+
+statement error
+SELECT * FROM milvus_backup_collections('test/fixtures/does-not-exist', 'alpha');
+----
+
+statement error
+SELECT * FROM milvus_backup_collections('test/fixtures/backups', '../escape');
+----
+
+statement error
+SELECT * FROM milvus_backup_collections('test/fixtures/backups', NULL);
+----
+
+query I
+SELECT count(*) FROM milvus_backup_collections('test/fixtures/backups', 'beta');
+----
+2
+
+# beta/messages: full linkage, so counts are attributed exactly; the entry
+# carries no backup_timestamp, so the backup-level TSO applies (the writer
+# only stamps the tree level in older formats); deletes come from the l0
+# segment living at collection level; dim is parsed from type_params.
+query TTITIIIIITT
+SELECT db_name, collection_name, collection_id, consistency_level, shards_num, partition_count, segment_count, num_rows_inserted, has_delete_logs::INT, has_index::INT, partition_names
+FROM milvus_backup_collections('test/fixtures/backups', 'beta') WHERE collection_name = 'messages';
+----
+db1	messages	2	Bounded	2	1	1	7	1	1	[_default]
+
+query I
+SELECT backup_timestamp FROM milvus_backup_collections('test/fixtures/backups', 'beta') WHERE collection_name = 'messages';
+----
+455999000000000000
+
+# Schema fields surface as LIST(STRUCT): camelCase JSON keys (fieldID, autoID)
+# map onto the snake_case struct fields, DataType and ConsistencyLevel proto
+# enums render as names.
+query TTITTTT
+SELECT fields[1].name, fields[1].data_type, fields[1].field_id, fields[1].is_primary_key, fields[2].data_type, fields[2].dim, fields[3].data_type
+FROM milvus_backup_collections('test/fixtures/backups', 'beta') WHERE collection_name = 'messages';
+----
+id	Int64	100	true	FloatVector	4	JSON
+
+query TIT
+SELECT indexes[1].index_name, indexes[1].field_name, len(indexes)
+FROM milvus_backup_collections('test/fixtures/backups', 'beta') WHERE collection_name = 'messages';
+----
+vec_idx	vec	1
+
+# beta/users: no collection id in the entry, so nothing is attributable and
+# every count stays NULL (not zero) - the segment file's entries could belong
+# to this collection.
+query IIIIII
+SELECT (collection_id IS NULL)::INT, (partition_count IS NULL)::INT, (segment_count IS NULL)::INT, (num_rows_inserted IS NULL)::INT, (has_delete_logs IS NULL)::INT, (partition_names IS NULL)::INT
+FROM milvus_backup_collections('test/fixtures/backups', 'beta') WHERE collection_name = 'users';
+----
+1	1	1	1	1	1
+
+# alpha: the partition/segment entries predate collection ids, so counts are
+# unknowable even though the files exist; the per-entry TSO and physical
+# timestamp are present.
+query TIIIII
+SELECT collection_name, (partition_count IS NULL)::INT, (segment_count IS NULL)::INT, (has_delete_logs IS NULL)::INT, backup_timestamp, backup_physical_timestamp
+FROM milvus_backup_collections('test/fixtures/backups', 'alpha');
+----
+orders	1	1	1	455275622782205954	1699999999
+
+# gamma: snapshot backups provably have no partition/segment level (zero,
+# empty name list), but the row count is genuinely unknown.
+query IIIIII
+SELECT partition_count, segment_count, (num_rows_inserted IS NULL)::INT, has_delete_logs::INT, (partition_names IS NULL)::INT, len(partition_names)
+FROM milvus_backup_collections('test/fixtures/backups', 'gamma');
+----
+0	0	1	0	0	0
+
+# clean: full linkage with no delete records, so "no deletes" is provable.
+query IIIIT
+SELECT partition_count, segment_count, num_rows_inserted, has_delete_logs::INT, partition_names
+FROM milvus_backup_collections('test/fixtures/backups', 'clean');
+----
+1	1	5	0	[_default]
+
+# Single-argument overload: the path is the backup directory itself, and
+# backup_name comes from backup_meta.json instead of an argument.
+query TT
+SELECT backup_name, collection_name
+FROM milvus_backup_collections('test/fixtures/backups/beta') ORDER BY collection_name;
+----
+beta	messages
+beta	users
+
+# A root (or any directory without meta/backup_meta.json) is not a backup:
+# the single-argument form errors instead of guessing.
+statement error
+SELECT * FROM milvus_backup_collections('test/fixtures/backups');
+----
+
+statement error
+SELECT * FROM milvus_backup_collections('test/fixtures/does-not-exist');
+----
