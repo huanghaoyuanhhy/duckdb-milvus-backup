@@ -347,3 +347,7 @@ make test_debug
 ### Roadmap
 
 On the horizon: multi-collection scans with schema consistency checks, and a `milvus_backup_verify()` for integrity checks.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
