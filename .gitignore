@@ -7,3 +7,5 @@ duckdb_unittest_tempdir
 venv
 .DS_Store
 .zcode
+
+items.parquet
