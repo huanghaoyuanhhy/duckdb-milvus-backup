@@ -15,6 +15,47 @@ Looking inside a backup the normal way means restoring it first: a running Milvu
 
 ## Quick Start
 
+Download the prebuilt extension for your platform from the [v0.1.0 release](https://github.com/huanghaoyuanhhy/duckdb-milvus-backup/releases/tag/v0.1.0) and rename it to `milvus_backup.duckdb_extension` — DuckDB derives the extension's entry point from the file name, so the loaded file must carry exactly this name. The release is pinned to DuckDB **v2.0.0** exactly (the extension targets the unstable C API v2, so it loads only in this version):
+
+| Asset | Platform |
+|---|---|
+| `milvus_backup-0.1.0-duckdb2.0.0-osx_arm64.duckdb_extension` | macOS (Apple silicon) |
+| `milvus_backup-0.1.0-duckdb2.0.0-linux_amd64.duckdb_extension` | Linux (x86_64) |
+| `milvus_backup-0.1.0-duckdb2.0.0-linux_arm64.duckdb_extension` | Linux (arm64) |
+| `milvus_backup-0.1.0-duckdb2.0.0-windows_amd64.duckdb_extension` | Windows (x86_64) |
+
+Other platforms (including macOS Intel) and other DuckDB versions: [build from source](#building-from-source).
+
+On macOS, files downloaded through a browser carry a quarantine flag that blocks loading; clear it once after the rename:
+
+```shell
+mv milvus_backup-0.1.0-duckdb2.0.0-osx_arm64.duckdb_extension milvus_backup.duckdb_extension
+xattr -d com.apple.quarantine milvus_backup.duckdb_extension   # macOS, browser downloads only
+```
+
+The binaries are unsigned (signing keys are held by DuckDB Labs, not third parties), so start DuckDB with `-unsigned` and `LOAD` the file by absolute path:
+
+```shell
+duckdb -unsigned
+```
+
+```sql
+LOAD '/abs/path/to/milvus_backup.duckdb_extension';
+
+SELECT milvus_backup_version();
+```
+
+```
+┌─────────────────────────┐
+│ milvus_backup_version() │
+│         varchar         │
+├─────────────────────────┤
+│ milvus_backup 0.1.0     │
+└─────────────────────────┘
+```
+
+### Building from source
+
 You need a Rust toolchain, Python 3 with venv support, Make, and Git to build, plus the DuckDB **v2.0.0** CLI to load the result. The CLI version must match the extension's target version exactly — download it from the [DuckDB v2.0.0 release](https://github.com/duckdb/duckdb/releases/tag/v2.0.0) and put it on your `PATH` (or at `./build/duckdb`; the CLI is not produced by the extension build).
 
 ```shell
@@ -28,26 +69,7 @@ DUCKDB_TEST_VERSION=v2.0.0 make configure
 make debug        # or: make release
 ```
 
-Local extensions are unsigned, so start DuckDB with `-unsigned` and `LOAD` the file by absolute path:
-
-```shell
-duckdb -unsigned
-```
-
-```sql
-LOAD '/abs/path/to/build/debug/extension/milvus_backup/milvus_backup.duckdb_extension';
-
-SELECT milvus_backup_version();
-```
-
-```
-┌─────────────────────────┐
-│ milvus_backup_version() │
-│         varchar         │
-├─────────────────────────┤
-│ milvus_backup 0.1.0     │
-└─────────────────────────┘
-```
+Load the artifact from `build/debug/extension/milvus_backup/milvus_backup.duckdb_extension` the same way — `-unsigned` plus an absolute `LOAD` path (the file name here is already correct).
 
 ## A Walkthrough
 
@@ -166,9 +188,10 @@ WHERE id <= 1;
 
 ## Reading from S3
 
-Every function accepts `s3://` roots because they read through DuckDB's file system. Load `httpfs`, provide credentials, and pass URIs instead of paths:
+Every function accepts `s3://` roots because they read through DuckDB's file system. Install and load `httpfs`, provide credentials, and pass URIs instead of paths:
 
 ```sql
+INSTALL httpfs;   -- once; LOAD alone fails if the extension was never installed
 LOAD 'httpfs';
 
 CREATE SECRET (
