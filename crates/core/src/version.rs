@@ -12,8 +12,8 @@ pub(crate) struct VersionScalar;
 impl ScalarInitCallbacks for VersionScalar {
     fn init(
         &self,
-        _bind_data: Option<&Self::BindData>,
         _context: &Context,
+        _bind_data: Option<&Self::BindData>,
     ) -> Result<Self::InitData> {
         Ok(concat!("milvus_backup ", env!("CARGO_PKG_VERSION")).to_string())
     }
@@ -25,9 +25,9 @@ impl ScalarCallbacks for VersionScalar {
 
     fn exec(
         &self,
+        _context: &Context,
         _bind_data: Option<&Self::BindData>,
         init_data: Option<&mut Self::InitData>,
-        _context: &Context,
         _vectors: &mut duckdb_neo::data_chunk::VectorCollection,
         output: Vector<'_, Unknown>,
     ) -> Result<()> {
@@ -35,7 +35,7 @@ impl ScalarCallbacks for VersionScalar {
         let mut output = output.cast::<String>()?;
         output.set_size(1)?;
         let mut writer = output.writer()?;
-        writer.set(0, Some(init_data.unwrap().as_str()))?;
+        writer.set(0, init_data.unwrap().as_str())?;
         Ok(())
     }
 }

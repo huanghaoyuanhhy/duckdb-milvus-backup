@@ -15,21 +15,21 @@ Looking inside a backup the normal way means restoring it first: a running Milvu
 
 ## Quick Start
 
-Download the prebuilt extension for your platform from the [v0.1.0 release](https://github.com/huanghaoyuanhhy/duckdb-milvus-backup/releases/tag/v0.1.0) and rename it to `milvus_backup.duckdb_extension` — DuckDB derives the extension's entry point from the file name, so the loaded file must carry exactly this name. The release is pinned to DuckDB **v2.0.0** exactly (the extension targets the unstable C API v2, so it loads only in this version):
+Download the prebuilt extension for your platform from the [v0.1.1 release](https://github.com/huanghaoyuanhhy/duckdb-milvus-backup/releases/tag/v0.1.1) and rename it to `milvus_backup.duckdb_extension` — DuckDB derives the extension's entry point from the file name, so the loaded file must carry exactly this name. The release is pinned to DuckDB **v2.0.1** exactly (the extension targets the unstable C API v2, so it loads only in this version):
 
 | Asset | Platform |
 |---|---|
-| `milvus_backup-0.1.0-duckdb2.0.0-osx_arm64.duckdb_extension` | macOS (Apple silicon) |
-| `milvus_backup-0.1.0-duckdb2.0.0-linux_amd64.duckdb_extension` | Linux (x86_64) |
-| `milvus_backup-0.1.0-duckdb2.0.0-linux_arm64.duckdb_extension` | Linux (arm64) |
-| `milvus_backup-0.1.0-duckdb2.0.0-windows_amd64.duckdb_extension` | Windows (x86_64) |
+| `milvus_backup-0.1.1-duckdb2.0.1-osx_arm64.duckdb_extension` | macOS (Apple silicon) |
+| `milvus_backup-0.1.1-duckdb2.0.1-linux_amd64.duckdb_extension` | Linux (x86_64) |
+| `milvus_backup-0.1.1-duckdb2.0.1-linux_arm64.duckdb_extension` | Linux (arm64) |
+| `milvus_backup-0.1.1-duckdb2.0.1-windows_amd64.duckdb_extension` | Windows (x86_64) |
 
 Other platforms (including macOS Intel) and other DuckDB versions: [build from source](#building-from-source).
 
 On macOS, files downloaded through a browser carry a quarantine flag that blocks loading; clear it once after the rename:
 
 ```shell
-mv milvus_backup-0.1.0-duckdb2.0.0-osx_arm64.duckdb_extension milvus_backup.duckdb_extension
+mv milvus_backup-0.1.1-duckdb2.0.1-osx_arm64.duckdb_extension milvus_backup.duckdb_extension
 xattr -d com.apple.quarantine milvus_backup.duckdb_extension   # macOS, browser downloads only
 ```
 
@@ -50,20 +50,20 @@ SELECT milvus_backup_version();
 │ milvus_backup_version() │
 │         varchar         │
 ├─────────────────────────┤
-│ milvus_backup 0.1.0     │
+│ milvus_backup 0.1.1     │
 └─────────────────────────┘
 ```
 
 ### Building from source
 
-You need a Rust toolchain, Python 3 with venv support, Make, and Git to build, plus the DuckDB **v2.0.0** CLI to load the result. The CLI version must match the extension's target version exactly — download it from the [DuckDB v2.0.0 release](https://github.com/duckdb/duckdb/releases/tag/v2.0.0) and put it on your `PATH` (or at `./build/duckdb`; the CLI is not produced by the extension build).
+You need a Rust toolchain, Python 3 with venv support, Make, and Git to build, plus the DuckDB **v2.0.1** CLI to load the result. The CLI version must match the extension's target version exactly — download it from the [DuckDB v2.0.1 release](https://github.com/duckdb/duckdb/releases/tag/v2.0.1) and put it on your `PATH` (or at `./build/duckdb`; the CLI is not produced by the extension build).
 
 ```shell
 git clone --recurse-submodules <repo-url>
 cd duckdb-milvus-backup
 
-# Creates a Python venv, installs the DuckDB v2.0.0 test client, detects the platform
-DUCKDB_TEST_VERSION=v2.0.0 make configure
+# Creates a Python venv, installs the DuckDB v2.0.1 test client, detects the platform
+DUCKDB_TEST_VERSION=v2.0.1 make configure
 
 # Builds with cargo and appends extension metadata; artifacts land in build/debug
 make debug        # or: make release
@@ -304,11 +304,11 @@ Two writer-side caveats:
 
 ## Development
 
-The repository was initialized from the experimental [duckdb/extension-template-rs](https://github.com/duckdb/extension-template-rs) template. It is a pure Rust extension based on DuckDB C Extension API v2 (`duckdb-neo` + `duckdb-loadable-macros`, targeting DuckDB **v2.0.0**; versions must match exactly), requiring neither a DuckDB source build nor C/C++ code; the `extension-ci-tools` CI/CD pipeline is preconfigured.
+The repository was initialized from the experimental [duckdb/extension-template-rs](https://github.com/duckdb/extension-template-rs) template. It is a pure Rust extension based on DuckDB C Extension API v2 (`duckdb-neo` + `duckdb-loadable-macros`, targeting DuckDB **v2.0.1**; versions must match exactly), requiring neither a DuckDB source build nor C/C++ code; the `extension-ci-tools` CI/CD pipeline is preconfigured.
 
 ### Testing
 
-Tests use the SQLLogicTest format and live in `test/sql/`. They run through the DuckDB Python client installed by `make configure`, pinned to v2.0.0:
+Tests use the SQLLogicTest format and live in `test/sql/`. They run through the DuckDB Python client installed by `make configure`, pinned to v2.0.1:
 
 ```shell
 make test_debug    # Or make test_release
@@ -350,12 +350,12 @@ Dependency versions are managed centrally in the root `Cargo.toml`; `upgrade.sh`
 
 `DUCKDB_TEST_VERSION` controls only the test client version; **it does not change the extension build target**. To change the target version, use `upgrade.sh` to update duckdb-neo, duckdb-loadable-macros, the `Makefile`, the workflow, and the extension entry point together. Both crates must correspond to the same DuckDB version.
 
-The example below uses the crate versions for v2.0.0. To target another release, update the first three variables:
+The example below uses the crate versions for v2.0.1. To target another release, update the first three variables:
 
 ```shell
-NEO_VERSION=0.20000.0
-MACROS_VERSION=1.20000.0
-DUCKDB_VERSION=v2.0.0
+NEO_VERSION=0.20001.0
+MACROS_VERSION=1.20001.0
+DUCKDB_VERSION=v2.0.1
 
 ./upgrade.sh "$NEO_VERSION" "$MACROS_VERSION"
 cargo update

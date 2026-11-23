@@ -12,24 +12,24 @@
 //! "unknown is NULL" rule as `milvus_backups`.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
 use duckdb_neo::{
-    DuckDBType, Error, Result,
-    bind_arguments::BindArgument,
-    connection::{Context, FFILink},
-    data_chunk::DataChunkRef,
+    AsDuckDB, DuckDBType, Error, Result,
+    bind_arguments::BindArguments,
+    connection::Context,
+    data_chunk::DataChunk,
     extension::Extension,
     file::FileSystem,
-    logical_type::LogicalType,
     signature::{FunctionDocumentationBuilder, FunctionParameter, SignatureBuilder},
     table_function::{
         BindFunctionHandle, ExecColumnInfo, InitColumnData, OrderPreservation,
         TableFunctionBuilder, TableFunctionCallbacks,
     },
-    types::{List, Struct, StructSchema, StructValue, StructWrite},
+    types::List,
 };
 
 use crate::meta::{
@@ -60,38 +60,6 @@ pub(crate) struct GlobalState {
 // One collection = one row, claimed from the shared counter like backups.
 type LocalState = ();
 
-/// DuckDB STRUCT schema of a `fields` entry. Field order must match the
-/// write order in `exec`.
-struct FieldStruct;
-
-impl StructSchema for FieldStruct {
-    fn fields<C: FFILink + ?Sized>(link: &C) -> Result<Vec<(&'static str, LogicalType)>> {
-        Ok(vec![
-            ("name", String::logical_type(link)?),
-            ("field_id", i64::logical_type(link)?),
-            ("data_type", String::logical_type(link)?),
-            ("is_primary_key", bool::logical_type(link)?),
-            ("element_type", String::logical_type(link)?),
-            ("dim", i64::logical_type(link)?),
-            ("auto_id", bool::logical_type(link)?),
-            ("is_dynamic", bool::logical_type(link)?),
-        ])
-    }
-}
-
-/// DuckDB STRUCT schema of an `indexes` entry.
-struct IndexStruct;
-
-impl StructSchema for IndexStruct {
-    fn fields<C: FFILink + ?Sized>(link: &C) -> Result<Vec<(&'static str, LogicalType)>> {
-        Ok(vec![
-            ("index_name", String::logical_type(link)?),
-            ("index_type", String::logical_type(link)?),
-            ("field_name", String::logical_type(link)?),
-        ])
-    }
-}
-
 impl TableFunctionCallbacks for CollectionsFunction {
     type BindData = BindData;
     type GlobalState = GlobalState;
@@ -100,7 +68,7 @@ impl TableFunctionCallbacks for CollectionsFunction {
     fn bind(
         &self,
         context: &Context,
-        arguments: Vec<BindArgument>,
+        arguments: BindArguments<'_>,
         bind_handle: BindFunctionHandle<'_>,
     ) -> Result<Self::BindData> {
         let root = normalize_root(constant_string(&arguments, 0, "root_path")?);
@@ -111,27 +79,37 @@ impl TableFunctionCallbacks for CollectionsFunction {
 
     fn init_global_state(
         &self,
-        bind_data: &Self::BindData,
         context: &Context,
+        bind_data: &Self::BindData,
         column_data: InitColumnData<'_>,
-    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
-        init_global(bind_data, context, column_data)
+    ) -> Result<Option<Self::GlobalState>> {
+        init_global(context, bind_data, column_data)
+    }
+
+    fn max_threads(
+        &self,
+        _context: &Context,
+        bind_data: &Self::BindData,
+        _global_state: Option<&Self::GlobalState>,
+        _column_data: InitColumnData<'_>,
+    ) -> Result<Option<NonZeroUsize>> {
+        Ok(NonZeroUsize::new(bind_data.rows.len()))
     }
 
     fn exec(
         &self,
-        bind_data: &Self::BindData,
-        global_state: Option<&Self::GlobalState>,
-        local_state: Option<&mut Self::LocalState>,
         context: &Context,
-        output: DataChunkRef<'_>,
+        bind_data: &Self::BindData,
+        local_state: Option<&mut Self::LocalState>,
+        global_state: Option<&Self::GlobalState>,
+        output: &mut DataChunk<'_>,
         column_info: ExecColumnInfo<'_>,
     ) -> Result<()> {
         exec_rows(
-            bind_data,
-            global_state,
-            local_state,
             context,
+            bind_data,
+            local_state,
+            global_state,
             output,
             column_info,
         )
@@ -146,7 +124,7 @@ impl TableFunctionCallbacks for CollectionsAtPathFunction {
     fn bind(
         &self,
         context: &Context,
-        arguments: Vec<BindArgument>,
+        arguments: BindArguments<'_>,
         bind_handle: BindFunctionHandle<'_>,
     ) -> Result<Self::BindData> {
         let path = normalize_root(constant_string(&arguments, 0, "path")?);
@@ -155,27 +133,37 @@ impl TableFunctionCallbacks for CollectionsAtPathFunction {
 
     fn init_global_state(
         &self,
-        bind_data: &Self::BindData,
         context: &Context,
+        bind_data: &Self::BindData,
         column_data: InitColumnData<'_>,
-    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
-        init_global(bind_data, context, column_data)
+    ) -> Result<Option<Self::GlobalState>> {
+        init_global(context, bind_data, column_data)
+    }
+
+    fn max_threads(
+        &self,
+        _context: &Context,
+        bind_data: &Self::BindData,
+        _global_state: Option<&Self::GlobalState>,
+        _column_data: InitColumnData<'_>,
+    ) -> Result<Option<NonZeroUsize>> {
+        Ok(NonZeroUsize::new(bind_data.rows.len()))
     }
 
     fn exec(
         &self,
-        bind_data: &Self::BindData,
-        global_state: Option<&Self::GlobalState>,
-        local_state: Option<&mut Self::LocalState>,
         context: &Context,
-        output: DataChunkRef<'_>,
+        bind_data: &Self::BindData,
+        local_state: Option<&mut Self::LocalState>,
+        global_state: Option<&Self::GlobalState>,
+        output: &mut DataChunk<'_>,
         column_info: ExecColumnInfo<'_>,
     ) -> Result<()> {
         exec_rows(
-            bind_data,
-            global_state,
-            local_state,
             context,
+            bind_data,
+            local_state,
+            global_state,
             output,
             column_info,
         )
@@ -268,16 +256,10 @@ fn bind_backup_dir(
     bind_handle.add_result_column("num_rows_inserted", &i64::logical_type(context)?)?;
     bind_handle.add_result_column("has_delete_logs", &bool::logical_type(context)?)?;
     bind_handle.add_result_column("has_index", &bool::logical_type(context)?)?;
-    bind_handle.add_result_column("aliases", &Vec::<String>::logical_type(context)?)?;
-    bind_handle.add_result_column("partition_names", &Vec::<String>::logical_type(context)?)?;
-    bind_handle.add_result_column(
-        "indexes",
-        &Vec::<StructValue<IndexStruct>>::logical_type(context)?,
-    )?;
-    bind_handle.add_result_column(
-        "fields",
-        &Vec::<StructValue<FieldStruct>>::logical_type(context)?,
-    )?;
+    bind_handle.add_result_column("aliases", &List::<String>::logical_type(context)?)?;
+    bind_handle.add_result_column("partition_names", &List::<String>::logical_type(context)?)?;
+    bind_handle.add_result_column("indexes", &List::<IndexEntry>::logical_type(context)?)?;
+    bind_handle.add_result_column("fields", &List::<FieldEntry>::logical_type(context)?)?;
 
     let backup_name = provided_name.or(backup_meta.name);
     Ok(BindData { backup_name, rows })
@@ -285,26 +267,22 @@ fn bind_backup_dir(
 
 /// Shared init for both overloads.
 fn init_global(
-    bind_data: &BindData,
     _context: &Context,
+    _bind_data: &BindData,
     _column_data: InitColumnData<'_>,
-) -> Result<(Option<GlobalState>, Option<usize>)> {
-    let collection_count = bind_data.rows.len();
-    Ok((
-        Some(GlobalState {
-            next_collection: AtomicUsize::new(0),
-        }),
-        (collection_count > 0).then_some(collection_count),
-    ))
+) -> Result<Option<GlobalState>> {
+    Ok(Some(GlobalState {
+        next_collection: AtomicUsize::new(0),
+    }))
 }
 
 /// Shared exec for both overloads: emit the claimed row.
 fn exec_rows(
-    bind_data: &BindData,
-    global_state: Option<&GlobalState>,
-    _local_state: Option<&mut LocalState>,
     _context: &Context,
-    mut output: DataChunkRef<'_>,
+    bind_data: &BindData,
+    _local_state: Option<&mut LocalState>,
+    global_state: Option<&GlobalState>,
+    output: &mut DataChunk<'_>,
     _column_info: ExecColumnInfo<'_>,
 ) -> Result<()> {
     let claimed = global_state
@@ -323,84 +301,81 @@ fn exec_rows(
         ($index:expr, $ty:ty, $value:expr) => {{
             let mut vector = output.get_vector_at_mut::<$ty>($index)?;
             vector.set_size(1)?;
-            vector.writer()?.set(0, $value)?;
+            vector.writer()?.set_option(0, $value)?;
         }};
     }
 
     write_column!(0, String, bind_data.backup_name.as_deref());
     write_column!(1, String, row.db_name.as_deref());
     write_column!(2, String, row.collection_name.as_deref());
-    write_column!(3, i64, row.collection_id);
-    write_column!(4, u64, row.backup_timestamp);
-    write_column!(5, u64, row.backup_physical_timestamp);
-    write_column!(6, i64, row.shards_num);
+    write_column!(3, i64, row.collection_id.as_ref());
+    write_column!(4, u64, row.backup_timestamp.as_ref());
+    write_column!(5, u64, row.backup_physical_timestamp.as_ref());
+    write_column!(6, i64, row.shards_num.as_ref());
     write_column!(7, String, row.consistency_level.as_deref());
-    write_column!(8, i64, row.size_bytes);
-    write_column!(9, i64, row.partition_count);
-    write_column!(10, i64, row.segment_count);
-    write_column!(11, i64, row.num_rows_inserted);
-    write_column!(12, bool, row.has_delete_logs);
-    write_column!(13, bool, row.has_index);
+    write_column!(8, i64, row.size_bytes.as_ref());
+    write_column!(9, i64, row.partition_count.as_ref());
+    write_column!(10, i64, row.segment_count.as_ref());
+    write_column!(11, i64, row.num_rows_inserted.as_ref());
+    write_column!(12, bool, row.has_delete_logs.as_ref());
+    write_column!(13, bool, row.has_index.as_ref());
 
     // LIST columns: None = the level data itself is unknown; [] would
     // mean "provably empty".
     let mut write_string_list = |index: usize, values: Option<&Vec<String>>| -> Result<()> {
         let mut vector = output.get_vector_at_mut::<List<String>>(index)?;
         vector.set_size(1)?;
-        vector.writer()?.set(
-            0,
-            values.map(|names| {
-                names
-                    .iter()
-                    .map(|name| Some(name.as_str()))
-                    .collect::<Vec<Option<&str>>>()
-            }),
-        )?;
+        match values {
+            Some(names) => {
+                vector.set_child_size(names.len())?;
+                vector
+                    .list_writer()?
+                    .set_elements(0, names.iter().map(|name| Some(name.as_str())))?;
+            }
+            None => {
+                vector.set_child_size(0)?;
+                vector.list_writer()?.set_null(0)?;
+            }
+        }
         Ok(())
     };
     write_string_list(14, row.aliases.as_ref())?;
     write_string_list(15, row.partition_names.as_ref())?;
 
-    // LIST(STRUCT) columns: bind declared the struct field names via the
-    // StructSchema impls, so writes only need the values in that order.
-    let indexes = row.indexes.as_ref().map(|indexes| {
-        indexes
-            .iter()
-            .map(|index| {
-                Some(
-                    StructWrite::default()
-                        .field::<String>(index.index_name.as_deref())
-                        .field::<String>(index.index_type.as_deref())
-                        .field::<String>(index.field_name.as_deref()),
-                )
-            })
-            .collect::<Vec<Option<StructWrite>>>()
-    });
-    let mut vector = output.get_vector_at_mut::<List<Struct>>(16)?;
-    vector.set_size(1)?;
-    vector.writer()?.set(0, indexes)?;
+    // LIST(STRUCT) columns.
+    {
+        let mut vector = output.get_vector_at_mut::<List<IndexEntry>>(16)?;
+        vector.set_size(1)?;
+        match row.indexes.as_ref() {
+            Some(indexes) => {
+                vector.set_child_size(indexes.len())?;
+                vector
+                    .list_writer()?
+                    .set_elements(0, indexes.iter().map(Some))?;
+            }
+            None => {
+                vector.set_child_size(0)?;
+                vector.list_writer()?.set_null(0)?;
+            }
+        }
+    }
 
-    let fields = row.fields.as_ref().map(|fields| {
-        fields
-            .iter()
-            .map(|field| {
-                Some(
-                    StructWrite::default()
-                        .field::<String>(field.name.as_deref())
-                        .field::<i64>(field.field_id)
-                        .field::<String>(field.data_type.as_deref())
-                        .field::<bool>(field.is_primary_key)
-                        .field::<String>(field.element_type.as_deref())
-                        .field::<i64>(field.dim)
-                        .field::<bool>(field.auto_id)
-                        .field::<bool>(field.is_dynamic),
-                )
-            })
-            .collect::<Vec<Option<StructWrite>>>()
-    });
-    let mut vector = output.get_vector_at_mut::<List<Struct>>(17)?;
-    vector.set_size(1)?;
-    vector.writer()?.set(0, fields)?;
+    {
+        let mut vector = output.get_vector_at_mut::<List<FieldEntry>>(17)?;
+        vector.set_size(1)?;
+        match row.fields.as_ref() {
+            Some(fields) => {
+                vector.set_child_size(fields.len())?;
+                vector
+                    .list_writer()?
+                    .set_elements(0, fields.iter().map(Some))?;
+            }
+            None => {
+                vector.set_child_size(0)?;
+                vector.list_writer()?.set_null(0)?;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -427,6 +402,8 @@ struct CollectionRow {
     fields: Option<Vec<FieldEntry>>,
 }
 
+#[derive(AsDuckDB)]
+#[duckdb(writer)]
 struct FieldEntry {
     name: Option<String>,
     field_id: Option<i64>,
@@ -438,6 +415,8 @@ struct FieldEntry {
     is_dynamic: Option<bool>,
 }
 
+#[derive(AsDuckDB)]
+#[duckdb(writer)]
 struct IndexEntry {
     index_name: Option<String>,
     index_type: Option<String>,

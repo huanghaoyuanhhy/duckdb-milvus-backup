@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use duckdb_neo::{
     Error, Result,
-    bind_arguments::BindArgument,
+    bind_arguments::BindArguments,
     file::{FileBuilder, FileSystem},
 };
 
@@ -109,14 +109,15 @@ pub(crate) fn backup_dir(root: &str, backup_name: &str) -> Result<String> {
 /// Fold a constant string argument (table function params must be constants:
 /// bind runs once per call site, a non-constant arg would re-read meta per row).
 pub(crate) fn constant_string(
-    arguments: &[BindArgument],
+    arguments: &BindArguments<'_>,
     index: usize,
     name: &str,
 ) -> Result<String> {
-    let argument = arguments
-        .get(index)
-        .ok_or_else(|| Error::invalid_parameter(format!("{name} is required")))?;
-    let value = argument.value.as_ref().ok_or_else(|| {
+    if index >= arguments.len()? {
+        return Err(Error::invalid_parameter(format!("{name} is required")));
+    }
+    let argument = arguments.arg(index)?;
+    let value = argument.value()?.ok_or_else(|| {
         Error::invalid_input(format!(
             "{name} must be a constant string, e.g. milvus_backups('/mnt/backups')"
         ))

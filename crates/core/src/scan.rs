@@ -14,16 +14,17 @@
 //! DuckDB's FileSystem, so `s3://` paths work via httpfs credentials.
 
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 
 use duckdb_neo::{
-    DuckDBType, Error, Parameters, Result, ToValue,
-    bind_arguments::BindArgument,
+    AsDuckDB, DuckDBType, Error, Parameters, Result, ToValue,
+    bind_arguments::BindArguments,
     connection::{Context, FFILink},
-    data_chunk::DataChunkRef,
+    data_chunk::DataChunk,
     extension::Extension,
     file::{File, FileBuilder, FileSystem},
     logical_type::LogicalType,
@@ -34,8 +35,9 @@ use duckdb_neo::{
         BindFunctionHandle, ExecColumnInfo, InitColumnData, OrderPreservation,
         TableClaimBatchCallbacks, TableFunctionBuilder, TableFunctionCallbacks,
     },
-    types::{Array, BlobValue, List, Struct, StructSchema, StructValue, StructWrite},
+    types::{BlobValue, List},
     value::Value,
+    vector::{RowWriter, Unknown},
 };
 
 use crate::binlog::{self, BinlogKind};
@@ -141,7 +143,7 @@ impl TableFunctionCallbacks for ScanFunction {
     fn bind(
         &self,
         context: &Context,
-        arguments: Vec<BindArgument>,
+        arguments: BindArguments<'_>,
         bind_handle: BindFunctionHandle<'_>,
     ) -> Result<Self::BindData> {
         let root = normalize_root(constant_string(&arguments, 0, "root_path")?);
@@ -152,42 +154,52 @@ impl TableFunctionCallbacks for ScanFunction {
 
     fn init_global_state(
         &self,
-        bind_data: &Self::BindData,
         context: &Context,
+        bind_data: &Self::BindData,
         column_data: InitColumnData<'_>,
-    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
-        init_global_state(bind_data, context, column_data)
+    ) -> Result<Option<Self::GlobalState>> {
+        init_global_state(context, bind_data, column_data)
+    }
+
+    fn max_threads(
+        &self,
+        _context: &Context,
+        bind_data: &Self::BindData,
+        _global_state: Option<&Self::GlobalState>,
+        _column_data: InitColumnData<'_>,
+    ) -> Result<Option<NonZeroUsize>> {
+        Ok(NonZeroUsize::new(bind_data.tasks.len()))
     }
 
     fn init_local_state(
         &self,
+        context: &Context,
         bind_data: &Self::BindData,
         global_state: Option<&Self::GlobalState>,
-        context: &Context,
         column_data: InitColumnData<'_>,
     ) -> Result<Option<Self::LocalState>> {
-        init_local_state(bind_data, global_state, context, column_data)
+        init_local_state(context, bind_data, global_state, column_data)
     }
 
     fn progress(
         &self,
+        context: &Context,
         bind_data: &Self::BindData,
         global_state: Option<&Self::GlobalState>,
-        context: &Context,
     ) -> Result<Option<f64>> {
-        progress_report(bind_data, global_state, context)
+        progress_report(context, bind_data, global_state)
     }
 
     fn exec(
         &self,
-        bind_data: &Self::BindData,
-        global_state: Option<&Self::GlobalState>,
-        local_state: Option<&mut Self::LocalState>,
         context: &Context,
-        output: DataChunkRef<'_>,
+        bind_data: &Self::BindData,
+        local_state: Option<&mut Self::LocalState>,
+        global_state: Option<&Self::GlobalState>,
+        output: &mut DataChunk<'_>,
         column_info: ExecColumnInfo<'_>,
     ) -> Result<()> {
-        exec_chunk(bind_data, global_state, local_state, context, output, column_info)
+        exec_chunk(context, bind_data, local_state, global_state, output, column_info)
     }
 }
 
@@ -199,7 +211,7 @@ impl TableFunctionCallbacks for ScanAtPathFunction {
     fn bind(
         &self,
         context: &Context,
-        arguments: Vec<BindArgument>,
+        arguments: BindArguments<'_>,
         bind_handle: BindFunctionHandle<'_>,
     ) -> Result<Self::BindData> {
         let path = normalize_root(constant_string(&arguments, 0, "path")?);
@@ -208,66 +220,76 @@ impl TableFunctionCallbacks for ScanAtPathFunction {
 
     fn init_global_state(
         &self,
-        bind_data: &Self::BindData,
         context: &Context,
+        bind_data: &Self::BindData,
         column_data: InitColumnData<'_>,
-    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
-        init_global_state(bind_data, context, column_data)
+    ) -> Result<Option<Self::GlobalState>> {
+        init_global_state(context, bind_data, column_data)
+    }
+
+    fn max_threads(
+        &self,
+        _context: &Context,
+        bind_data: &Self::BindData,
+        _global_state: Option<&Self::GlobalState>,
+        _column_data: InitColumnData<'_>,
+    ) -> Result<Option<NonZeroUsize>> {
+        Ok(NonZeroUsize::new(bind_data.tasks.len()))
     }
 
     fn init_local_state(
         &self,
+        context: &Context,
         bind_data: &Self::BindData,
         global_state: Option<&Self::GlobalState>,
-        context: &Context,
         column_data: InitColumnData<'_>,
     ) -> Result<Option<Self::LocalState>> {
-        init_local_state(bind_data, global_state, context, column_data)
+        init_local_state(context, bind_data, global_state, column_data)
     }
 
     fn progress(
         &self,
+        context: &Context,
         bind_data: &Self::BindData,
         global_state: Option<&Self::GlobalState>,
-        context: &Context,
     ) -> Result<Option<f64>> {
-        progress_report(bind_data, global_state, context)
+        progress_report(context, bind_data, global_state)
     }
 
     fn exec(
         &self,
-        bind_data: &Self::BindData,
-        global_state: Option<&Self::GlobalState>,
-        local_state: Option<&mut Self::LocalState>,
         context: &Context,
-        output: DataChunkRef<'_>,
+        bind_data: &Self::BindData,
+        local_state: Option<&mut Self::LocalState>,
+        global_state: Option<&Self::GlobalState>,
+        output: &mut DataChunk<'_>,
         column_info: ExecColumnInfo<'_>,
     ) -> Result<()> {
-        exec_chunk(bind_data, global_state, local_state, context, output, column_info)
+        exec_chunk(context, bind_data, local_state, global_state, output, column_info)
     }
 }
 
 impl TableClaimBatchCallbacks for ScanFunction {
     fn claim_batch(
         &self,
-        bind_data: &Self::BindData,
-        global_state: Option<&Self::GlobalState>,
-        local_state: Option<&mut Self::LocalState>,
         context: &Context,
+        bind_data: &Self::BindData,
+        local_state: Option<&mut Self::LocalState>,
+        global_state: Option<&Self::GlobalState>,
     ) -> Result<bool> {
-        claim_batch(bind_data, global_state, local_state, context)
+        claim_batch(context, bind_data, local_state, global_state)
     }
 }
 
 impl TableClaimBatchCallbacks for ScanAtPathFunction {
     fn claim_batch(
         &self,
-        bind_data: &Self::BindData,
-        global_state: Option<&Self::GlobalState>,
-        local_state: Option<&mut Self::LocalState>,
         context: &Context,
+        bind_data: &Self::BindData,
+        local_state: Option<&mut Self::LocalState>,
+        global_state: Option<&Self::GlobalState>,
     ) -> Result<bool> {
-        claim_batch(bind_data, global_state, local_state, context)
+        claim_batch(context, bind_data, local_state, global_state)
     }
 }
 
@@ -276,10 +298,10 @@ impl TableClaimBatchCallbacks for ScanAtPathFunction {
 /// Shared init for both overloads: tombstones are built once per scan, so
 /// exec only reads the ready map.
 fn init_global_state(
-    bind_data: &BindData,
     context: &Context,
+    bind_data: &BindData,
     _column_data: InitColumnData<'_>,
-) -> Result<(Option<GlobalState>, Option<usize>)> {
+) -> Result<Option<GlobalState>> {
     let tombstones = OnceLock::new();
     if bind_data.apply_deletes && !bind_data.delta_sources.is_empty() {
         let built = build_tombstones(context, &bind_data.dir, &bind_data.delta_sources)?;
@@ -293,15 +315,14 @@ fn init_global_state(
         estimated_rows: bind_data.estimated_rows,
         tombstones,
     };
-    let threads = (!bind_data.tasks.is_empty()).then(|| bind_data.tasks.len());
-    Ok((Some(global), threads))
+    Ok(Some(global))
 }
 
 /// Shared local-state init for both overloads.
 fn init_local_state(
+    _context: &Context,
     _bind_data: &BindData,
     _global_state: Option<&GlobalState>,
-    _context: &Context,
     _column_data: InitColumnData<'_>,
 ) -> Result<Option<LocalState>> {
     Ok(Some(LocalState {
@@ -312,9 +333,9 @@ fn init_local_state(
 
 /// Shared progress for both overloads.
 fn progress_report(
+    _context: &Context,
     _bind_data: &BindData,
     global_state: Option<&GlobalState>,
-    _context: &Context,
 ) -> Result<Option<f64>> {
     let Some(global) = global_state else {
         return Ok(None);
@@ -331,10 +352,10 @@ fn progress_report(
 /// finished) — each call advances to the next task. File opening happens
 /// lazily in exec so this callback never blocks other threads on I/O.
 fn claim_batch(
-    bind_data: &BindData,
-    global_state: Option<&GlobalState>,
-    local_state: Option<&mut LocalState>,
     _context: &Context,
+    bind_data: &BindData,
+    local_state: Option<&mut LocalState>,
+    global_state: Option<&GlobalState>,
 ) -> Result<bool> {
     let Some(local) = local_state else {
         return Err(Error::api_error("scan local state missing"));
@@ -359,7 +380,7 @@ fn claim_batch(
 /// earlier in the two-argument (path) form.
 fn bind_after_dir(
     context: &Context,
-    arguments: &[BindArgument],
+    arguments: &BindArguments<'_>,
     dir: &str,
     collection_index: usize,
     bind_handle: BindFunctionHandle<'_>,
@@ -900,11 +921,11 @@ fn field_error(field_name: &str, error: duckdb_neo::Error) -> Error {
 }
 
 fn exec_chunk(
-    bind_data: &BindData,
-    global_state: Option<&GlobalState>,
-    local_state: Option<&mut LocalState>,
     context: &Context,
-    mut output: DataChunkRef<'_>,
+    bind_data: &BindData,
+    local_state: Option<&mut LocalState>,
+    global_state: Option<&GlobalState>,
+    output: &mut DataChunk<'_>,
     column_info: ExecColumnInfo<'_>,
 ) -> Result<()> {
     let Some(local) = local_state else {
@@ -916,13 +937,7 @@ fn exec_chunk(
     let Some(task_index) = local.task_index.filter(|index| *index < bind_data.tasks.len()) else {
         // Claimed past the end: nothing to produce.
         for out_index in 0..column_info.count()? {
-            let bind_index = column_info.get_column_index(out_index)?;
-            set_column_size(
-                &mut output,
-                out_index,
-                &bind_data.columns[bind_index].target,
-                0,
-            )?;
+            set_column_size(output, out_index, 0)?;
         }
         return Ok(());
     };
@@ -953,6 +968,7 @@ fn exec_chunk(
         .map(|position| column_info.get_column_index(position))
         .collect::<Result<Vec<_>>>()?;
 
+    let mut col_cells: Vec<Vec<Option<Cell>>> = vec![Vec::new(); projection.len()];
     let mut rows = 0usize;
     loop {
         if rows == CHUNK_ROWS {
@@ -1004,10 +1020,10 @@ fn exec_chunk(
             }
         }
 
-        // Emit the surviving row into the projected output vectors.
+        // Collect surviving row cells per projected column so nested LIST/STRUCT
+        // vectors can size their children once and write through a single writer.
         for (out_index, bind_index) in projection.iter().enumerate() {
-            let cell = cursor.columns[*bind_index].peek();
-            write_cell(&mut output, out_index, rows, &bind_data.columns[*bind_index].target, cell)?;
+            col_cells[out_index].push(cursor.columns[*bind_index].peek().cloned());
         }
         for column in &mut cursor.columns {
             column.advance();
@@ -1015,9 +1031,19 @@ fn exec_chunk(
         rows += 1;
     }
 
-    for out_index in 0..projection.len() {
-        let bind_index = projection[out_index];
-        set_column_size(&mut output, out_index, &bind_data.columns[bind_index].target, rows)?;
+    if rows == 0 {
+        for out_index in 0..projection.len() {
+            set_column_size(output, out_index, 0)?;
+        }
+    } else {
+        for (out_index, bind_index) in projection.iter().enumerate() {
+            write_column_cells(
+                output,
+                out_index,
+                &bind_data.columns[*bind_index].target,
+                &col_cells[out_index],
+            )?;
+        }
     }
     global
         .rows_done
@@ -1025,50 +1051,10 @@ fn exec_chunk(
     Ok(())
 }
 
-/// Resize one projected output vector; needed because `get_vector_at_mut`
-/// validates the declared column type.
-fn set_column_size(
-    output: &mut DataChunkRef<'_>,
-    out_index: usize,
-    target: &TargetKind,
-    size: usize,
-) -> Result<()> {
-    macro_rules! resize {
-        ($ty:ty) => {{
-            let mut vector = output.get_vector_at_mut::<$ty>(out_index)?;
-            vector.set_size(size)?;
-        }};
-    }
-    match target {
-        TargetKind::Boolean => resize!(bool),
-        TargetKind::TinyInt => resize!(i8),
-        TargetKind::SmallInt => resize!(i16),
-        TargetKind::Int => resize!(i32),
-        TargetKind::BigInt => resize!(i64),
-        TargetKind::Float => resize!(f32),
-        TargetKind::Double => resize!(f64),
-        TargetKind::VarChar => resize!(String),
-        TargetKind::Blob => resize!(BlobValue),
-        TargetKind::FloatArray(_) => resize!(Array<f32>),
-        TargetKind::SparseStruct => resize!(Struct),
-        TargetKind::List(element) => match element.as_ref() {
-            TargetKind::Boolean => resize!(List<bool>),
-            TargetKind::TinyInt => resize!(List<i8>),
-            TargetKind::SmallInt => resize!(List<i16>),
-            TargetKind::Int => resize!(List<i32>),
-            TargetKind::BigInt => resize!(List<i64>),
-            TargetKind::Float => resize!(List<f32>),
-            TargetKind::Double => resize!(List<f64>),
-            TargetKind::VarChar => resize!(List<String>),
-            TargetKind::Blob => resize!(List<BlobValue>),
-            other => {
-                return Err(Error::invalid_input(format!(
-                    "nested {other:?} list elements are not supported yet"
-                )))
-            }
-        },
-    }
-    Ok(())
+/// Resize one projected output vector.
+fn set_column_size(output: &mut DataChunk<'_>, out_index: usize, size: usize) -> Result<()> {
+    let mut vector = output.get_vector_at_mut::<Unknown>(out_index)?;
+    vector.set_size(size)
 }
 
 fn tombstone_kills(tombstones: &Tombstones, pk_cell: &Cell, ts_cell: &Cell) -> bool {
@@ -1272,6 +1258,7 @@ fn build_column_cursor(
 // --- row assembly -----------------------------------------------------------
 
 /// One decoded row value, converted from the parquet page representation.
+#[derive(Clone)]
 enum Cell {
     Null,
     Bool(bool),
@@ -1568,31 +1555,33 @@ fn str_of(cell: &Cell) -> Option<&str> {
     }
 }
 
-/// Write one cell into the output vector at (`out_index`, `row`).
-fn write_cell(
-    output: &mut DataChunkRef<'_>,
+/// Write one projected column's cells for the whole chunk.
+fn write_column_cells(
+    output: &mut DataChunk<'_>,
     out_index: usize,
-    row: usize,
     target: &TargetKind,
-    cell: Option<&Cell>,
+    cells: &[Option<Cell>],
 ) -> Result<()> {
+    let rows = cells.len();
     macro_rules! scalar {
         ($ty:ty, $extract:expr) => {{
             let mut vector = output.get_vector_at_mut::<$ty>(out_index)?;
-            vector.set_size(row + 1)?;
-            let value = match cell {
-                None | Some(Cell::Null) => None,
-                Some(value) => match $extract(value) {
-                    Some(converted) => Some(converted),
-                    None => {
-                        return Err(Error::api_error(format!(
-                            "scan output column {out_index}: unexpected cell for {}",
-                            std::any::type_name::<$ty>()
-                        )))
-                    }
-                },
-            };
-            vector.writer()?.set(row, value)?;
+            vector.set_size(rows)?;
+            let mut writer = vector.writer()?;
+            for (row, cell) in cells.iter().enumerate() {
+                match cell {
+                    None | Some(Cell::Null) => writer.set_null(row)?,
+                    Some(value) => match $extract(value) {
+                        Some(converted) => writer.set(row, &converted)?,
+                        None => {
+                            return Err(Error::api_error(format!(
+                                "scan output column {out_index}: unexpected cell for {}",
+                                std::any::type_name::<$ty>()
+                            )))
+                        }
+                    },
+                }
+            }
         }};
     }
 
@@ -1627,152 +1616,251 @@ fn write_cell(
         }),
         TargetKind::VarChar => {
             let mut vector = output.get_vector_at_mut::<String>(out_index)?;
-            vector.set_size(row + 1)?;
-            let value = match cell {
-                None | Some(Cell::Null) => None,
-                Some(Cell::Bytes(bytes)) => {
-                    let text = std::str::from_utf8(bytes).map_err(|error| {
-                        Error::invalid_input(format!("VARCHAR column holds invalid UTF-8: {error}"))
-                    })?;
-                    Some(text)
-                }
-                Some(_) => {
-                    return Err(Error::api_error("scan output: non-string cell in VARCHAR column"))
-                }
-            };
-            vector.writer()?.set(row, value)?;
-        }
-        TargetKind::Blob => scalar!(BlobValue, bytes_of),
-        TargetKind::FloatArray(dim) => {
-            let mut vector = output.get_vector_at_mut::<Array<f32>>(out_index)?;
-            vector.set_size(row + 1)?;
-            let value = match cell {
-                None | Some(Cell::Null) => None,
-                Some(Cell::Bytes(bytes)) => {
-                    let floats = bytes
-                        .chunks_exact(4)
-                        .map(|chunk| Some(f32::from_le_bytes(chunk.try_into().unwrap())))
-                        .collect::<Vec<_>>();
-                    if floats.len() != *dim {
-                        return Err(Error::invalid_input(format!(
-                            "vector row has {} elements, expected {dim}",
-                            floats.len()
-                        )));
+            vector.set_size(rows)?;
+            let mut writer = vector.writer()?;
+            for (row, cell) in cells.iter().enumerate() {
+                match cell {
+                    None | Some(Cell::Null) => writer.set_null(row)?,
+                    Some(Cell::Bytes(bytes)) => {
+                        let text = std::str::from_utf8(bytes).map_err(|error| {
+                            Error::invalid_input(format!("VARCHAR column holds invalid UTF-8: {error}"))
+                        })?;
+                        writer.set(row, text)?;
                     }
-                    Some(floats)
+                    Some(_) => {
+                        return Err(Error::api_error("scan output: non-string cell in VARCHAR column"))
+                    }
                 }
-                Some(_) => return Err(Error::api_error("scan output: non-blob cell in vector column")),
-            };
-            vector.writer()?.set(row, value)?;
+            }
+        }
+        TargetKind::Blob => {
+            let mut vector = output.get_vector_at_mut::<BlobValue>(out_index)?;
+            vector.set_size(rows)?;
+            let mut writer = vector.writer()?;
+            for (row, cell) in cells.iter().enumerate() {
+                match cell {
+                    None | Some(Cell::Null) => writer.set_null(row)?,
+                    Some(value) => match bytes_of(value) {
+                        Some(bytes) => writer.set(row, bytes)?,
+                        None => {
+                            return Err(Error::api_error(format!(
+                                "scan output column {out_index}: unexpected cell for BlobValue"
+                            )))
+                        }
+                    },
+                }
+            }
+        }
+        TargetKind::FloatArray(dim) => {
+            let dim = *dim;
+            let mut vector = output.get_vector_at_mut::<Unknown>(out_index)?;
+            vector.set_size(rows)?;
+            for (row, cell) in cells.iter().enumerate() {
+                match cell {
+                    None | Some(Cell::Null) => vector.set_null_slow(row)?,
+                    Some(Cell::Bytes(bytes)) => {
+                        let floats = bytes
+                            .chunks_exact(4)
+                            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                            .collect::<Vec<_>>();
+                        if floats.len() != dim {
+                            return Err(Error::invalid_input(format!(
+                                "vector row has {} elements, expected {dim}",
+                                floats.len()
+                            )));
+                        }
+                        let mut children = vector
+                            .children_mut()
+                            .ok_or_else(|| Error::api_error("ARRAY vector missing element child"))?;
+                        let mut child = children.get_vector_at_mut::<f32>(0)?;
+                        child.writer()?.write_slice(row * dim, &floats)?;
+                    }
+                    Some(_) => {
+                        return Err(Error::api_error("scan output: non-blob cell in vector column"))
+                    }
+                }
+            }
         }
         TargetKind::SparseStruct => {
-            let mut vector = output.get_vector_at_mut::<Struct>(out_index)?;
-            vector.set_size(row + 1)?;
-            let value = match cell {
-                None | Some(Cell::Null) => None,
-                Some(Cell::Sparse(indices, values)) => Some(
-                    StructWrite::default()
-                        .field::<List<u32>>(Some(indices.iter().map(|&index| Some(index)).collect()))
-                        .field::<List<f32>>(Some(values.iter().map(|&value| Some(value)).collect())),
-                ),
-                Some(_) => {
-                    return Err(Error::api_error("scan output: non-sparse cell in sparse column"))
+            let mut total_nnz = 0usize;
+            for cell in cells {
+                match cell {
+                    None | Some(Cell::Null) => {}
+                    Some(Cell::Sparse(indices, values)) => {
+                        if indices.len() != values.len() {
+                            return Err(Error::api_error(
+                                "scan output: sparse indices/values length mismatch",
+                            ));
+                        }
+                        total_nnz += indices.len();
+                    }
+                    Some(_) => {
+                        return Err(Error::api_error("scan output: non-sparse cell in sparse column"))
+                    }
                 }
-            };
-            vector.writer()?.set(row, value)?;
+            }
+            let mut vector = output.get_vector_at_mut::<SparseRow>(out_index)?;
+            vector.set_size(rows)?;
+            {
+                let mut children = vector
+                    .children_mut()
+                    .ok_or_else(|| Error::api_error("STRUCT vector missing children"))?;
+                children
+                    .get_vector_at_mut::<List<u32>>(0)?
+                    .set_child_size(total_nnz)?;
+                children
+                    .get_vector_at_mut::<List<f32>>(1)?
+                    .set_child_size(total_nnz)?;
+            }
+            let mut writer = vector.row_writer()?;
+            for (row, cell) in cells.iter().enumerate() {
+                match cell {
+                    None | Some(Cell::Null) => writer.set_null(row)?,
+                    Some(Cell::Sparse(indices, values)) => {
+                        let value = SparseRow {
+                            indices: List(indices.iter().copied().map(Some).collect()),
+                            values: List(values.iter().copied().map(Some).collect()),
+                        };
+                        writer.set(row, &value)?;
+                    }
+                    Some(_) => unreachable!("validated above"),
+                }
+            }
         }
-        TargetKind::List(element) => write_list_cell(output, out_index, row, element, cell)?,
+        TargetKind::List(element) => write_list_column(output, out_index, element, cells)?,
     }
     Ok(())
 }
 
-fn write_list_cell(
-    output: &mut DataChunkRef<'_>,
+fn write_list_column(
+    output: &mut DataChunk<'_>,
     out_index: usize,
-    row: usize,
     element: &TargetKind,
-    cell: Option<&Cell>,
+    cells: &[Option<Cell>],
 ) -> Result<()> {
-    let elements: Option<&Vec<Cell>> = match cell {
-        None | Some(Cell::Null) => None,
-        Some(Cell::List(elements)) => Some(elements),
-        Some(_) => return Err(Error::api_error("scan output: non-list cell in LIST column")),
-    };
+    let rows = cells.len();
+    let mut total_elems = 0usize;
+    let mut row_lists: Vec<Option<&Vec<Cell>>> = Vec::with_capacity(rows);
+    for cell in cells {
+        match cell {
+            None | Some(Cell::Null) => row_lists.push(None),
+            Some(Cell::List(elements)) => {
+                total_elems += elements.len();
+                row_lists.push(Some(elements));
+            }
+            Some(_) => return Err(Error::api_error("scan output: non-list cell in LIST column")),
+        }
+    }
+
     // `$convert` maps a non-null Cell to the element's write value (None when
     // the cell variant does not fit the declared element type — an internal
     // inconsistency reported as an error).
-    macro_rules! list {
-        ($ty:ty, $elem:ty, $convert:expr) => {{
+    macro_rules! list_owned {
+        ($ty:ty, $convert:expr) => {{
             let mut vector = output.get_vector_at_mut::<List<$ty>>(out_index)?;
-            vector.set_size(row + 1)?;
-            let value = match elements {
-                None => None,
-                Some(rows) => {
-                    let converted = rows
-                        .iter()
-                        .map(|cell| match cell {
-                            Cell::Null => Some(None),
-                            cell => ($convert)(cell).map(Some),
-                        })
-                        .collect::<Option<Vec<Option<$elem>>>>();
-                    Some(converted.ok_or_else(|| {
-                        Error::api_error(
-                            "scan output: list element does not match the declared column type",
-                        )
-                    })?)
+            vector.set_size(rows)?;
+            vector.set_child_size(total_elems)?;
+            let mut writer = vector.list_writer()?;
+            for (row, elements) in row_lists.iter().enumerate() {
+                match elements {
+                    None => writer.set_null(row)?,
+                    Some(elems) => {
+                        let converted = elems
+                            .iter()
+                            .map(|cell| match cell {
+                                Cell::Null => Some(None),
+                                cell => ($convert)(cell).map(Some),
+                            })
+                            .collect::<Option<Vec<Option<$ty>>>>()
+                            .ok_or_else(|| {
+                                Error::api_error(
+                                    "scan output: list element does not match the declared column type",
+                                )
+                            })?;
+                        writer.set_elements(row, converted.iter().map(|v| v.as_ref()))?;
+                    }
                 }
-            };
-            vector.writer()?.set(row, value)?;
+            }
         }};
     }
+
+    macro_rules! list_ref {
+        ($ty:ty, $ref_ty:ty, $convert:expr) => {{
+            let mut vector = output.get_vector_at_mut::<List<$ty>>(out_index)?;
+            vector.set_size(rows)?;
+            vector.set_child_size(total_elems)?;
+            let mut writer = vector.list_writer()?;
+            for (row, elements) in row_lists.iter().enumerate() {
+                match elements {
+                    None => writer.set_null(row)?,
+                    Some(elems) => {
+                        let converted = elems
+                            .iter()
+                            .map(|cell| match cell {
+                                Cell::Null => Some(None),
+                                cell => ($convert)(cell).map(Some),
+                            })
+                            .collect::<Option<Vec<Option<$ref_ty>>>>()
+                            .ok_or_else(|| {
+                                Error::api_error(
+                                    "scan output: list element does not match the declared column type",
+                                )
+                            })?;
+                        writer.set_elements(row, converted)?;
+                    }
+                }
+            }
+        }};
+    }
+
     match element {
         TargetKind::Boolean => {
-            list!(bool, bool, |cell: &Cell| match cell {
+            list_owned!(bool, |cell: &Cell| match cell {
                 Cell::Bool(value) => Some(*value),
                 _ => None,
             })
         }
         TargetKind::TinyInt => {
-            list!(i8, i8, |cell: &Cell| match cell {
+            list_owned!(i8, |cell: &Cell| match cell {
                 Cell::Int(value) => i8::try_from(*value).ok(),
                 _ => None,
             })
         }
         TargetKind::SmallInt => {
-            list!(i16, i16, |cell: &Cell| match cell {
+            list_owned!(i16, |cell: &Cell| match cell {
                 Cell::Int(value) => i16::try_from(*value).ok(),
                 _ => None,
             })
         }
         TargetKind::Int => {
-            list!(i32, i32, |cell: &Cell| match cell {
+            list_owned!(i32, |cell: &Cell| match cell {
                 Cell::Int(value) => i32::try_from(*value).ok(),
                 _ => None,
             })
         }
         TargetKind::BigInt => {
-            list!(i64, i64, |cell: &Cell| match cell {
+            list_owned!(i64, |cell: &Cell| match cell {
                 Cell::Int(value) => Some(*value),
                 _ => None,
             })
         }
         TargetKind::Float => {
-            list!(f32, f32, |cell: &Cell| match cell {
+            list_owned!(f32, |cell: &Cell| match cell {
                 Cell::Float(value) => Some(*value),
                 _ => None,
             })
         }
         TargetKind::Double => {
-            list!(f64, f64, |cell: &Cell| match cell {
+            list_owned!(f64, |cell: &Cell| match cell {
                 Cell::Double(value) => Some(*value),
                 _ => None,
             })
         }
         TargetKind::VarChar => {
-            list!(String, &str, str_of)
+            list_ref!(String, &str, str_of)
         }
         TargetKind::Blob => {
-            list!(BlobValue, &[u8], bytes_of)
+            list_ref!(BlobValue, &[u8], bytes_of)
         }
         other => {
             return Err(Error::invalid_input(format!(
@@ -1786,15 +1874,11 @@ fn write_list_cell(
 // --- logical types ----------------------------------------------------------
 
 /// DuckDB STRUCT schema of the sparse-vector output column.
-struct SparseStructSchema;
-
-impl StructSchema for SparseStructSchema {
-    fn fields<C: FFILink + ?Sized>(link: &C) -> Result<Vec<(&'static str, LogicalType)>> {
-        Ok(vec![
-            ("indices", Vec::<u32>::logical_type(link)?),
-            ("values", Vec::<f32>::logical_type(link)?),
-        ])
-    }
+#[derive(AsDuckDB)]
+#[duckdb(writer)]
+struct SparseRow {
+    indices: List<u32>,
+    values: List<f32>,
 }
 
 fn logical_type_for(link: &Context, target: &TargetKind) -> Result<LogicalType> {
@@ -1814,7 +1898,7 @@ fn logical_type_for(link: &Context, target: &TargetKind) -> Result<LogicalType> 
             let length = (*dim as u64).value(link)?;
             link.logical_type_create("ARRAY", Parameters::positional(&[&child_value, &length]))?
         }
-        TargetKind::SparseStruct => StructValue::<SparseStructSchema>::logical_type(link)?,
+        TargetKind::SparseStruct => SparseRow::logical_type(link)?,
         TargetKind::List(element) => {
             let child = logical_type_for(link, element)?;
             let child_value = Value::from_logical_type(link, &child)?;
@@ -1888,15 +1972,16 @@ pub(crate) struct BinlogRef {
 
 /// Named boolean option; absent or NULL falls back to the default.
 fn optional_bool(
-    arguments: &[BindArgument],
+    arguments: &BindArguments<'_>,
     index: usize,
     name: &str,
     default: bool,
 ) -> Result<bool> {
-    let Some(argument) = arguments.get(index) else {
+    if index >= arguments.len()? {
         return Ok(default);
-    };
-    let Some(value) = argument.value.as_ref() else {
+    }
+    let argument = arguments.arg(index)?;
+    let Some(value) = argument.value()? else {
         return Ok(default);
     };
     value.get::<bool>()?.ok_or_else(|| {

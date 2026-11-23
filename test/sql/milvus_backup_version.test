@@ -13,4 +13,4 @@ require milvus_backup
 query T
 SELECT milvus_backup_version();
 ----
-milvus_backup 0.1.0
+milvus_backup 0.1.1

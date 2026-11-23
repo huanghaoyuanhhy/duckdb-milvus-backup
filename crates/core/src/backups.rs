@@ -8,15 +8,16 @@
 //! All reads go through DuckDB's FileSystem, so `s3://` roots work wherever
 //! httpfs is loaded; only meta JSON is ever read, never binlogs.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
 use duckdb_neo::{
     DuckDBType, Result,
-    bind_arguments::BindArgument,
+    bind_arguments::BindArguments,
     connection::Context,
-    data_chunk::DataChunkRef,
+    data_chunk::DataChunk,
     extension::Extension,
     file::FileSystem,
     signature::{FunctionDocumentationBuilder, FunctionParameter, SignatureBuilder},
@@ -56,7 +57,7 @@ impl TableFunctionCallbacks for BackupsFunction {
     fn bind(
         &self,
         context: &Context,
-        arguments: Vec<BindArgument>,
+        arguments: BindArguments<'_>,
         bind_handle: BindFunctionHandle<'_>,
     ) -> Result<Self::BindData> {
         let root = normalize_root(constant_string(&arguments, 0, "root_path")?);
@@ -87,9 +88,9 @@ impl TableFunctionCallbacks for BackupsFunction {
         bind_handle.add_result_column("created_at", &TimestampTzValue::logical_type(context)?)?;
         bind_handle.add_result_column("backup_timestamp", &u64::logical_type(context)?)?;
         bind_handle.add_result_column("size_bytes", &i64::logical_type(context)?)?;
-        bind_handle.add_result_column("databases", &Vec::<String>::logical_type(context)?)?;
+        bind_handle.add_result_column("databases", &List::<String>::logical_type(context)?)?;
         bind_handle
-            .add_result_column("collection_names", &Vec::<String>::logical_type(context)?)?;
+            .add_result_column("collection_names", &List::<String>::logical_type(context)?)?;
         bind_handle.add_result_column("collection_count", &i64::logical_type(context)?)?;
         bind_handle.add_result_column("partition_count", &i64::logical_type(context)?)?;
         bind_handle.add_result_column("segment_count", &i64::logical_type(context)?)?;
@@ -102,26 +103,32 @@ impl TableFunctionCallbacks for BackupsFunction {
 
     fn init_global_state(
         &self,
-        bind_data: &Self::BindData,
         _context: &Context,
+        _bind_data: &Self::BindData,
         _column_data: InitColumnData<'_>,
-    ) -> Result<(Option<Self::GlobalState>, Option<usize>)> {
-        let backup_count = bind_data.backup_dirs.len();
-        Ok((
-            Some(GlobalState {
-                next_backup: AtomicUsize::new(0),
-            }),
-            (backup_count > 0).then_some(backup_count),
-        ))
+    ) -> Result<Option<Self::GlobalState>> {
+        Ok(Some(GlobalState {
+            next_backup: AtomicUsize::new(0),
+        }))
+    }
+
+    fn max_threads(
+        &self,
+        _context: &Context,
+        bind_data: &Self::BindData,
+        _global_state: Option<&Self::GlobalState>,
+        _column_data: InitColumnData<'_>,
+    ) -> Result<Option<NonZeroUsize>> {
+        Ok(NonZeroUsize::new(bind_data.backup_dirs.len()))
     }
 
     fn exec(
         &self,
-        bind_data: &Self::BindData,
-        global_state: Option<&Self::GlobalState>,
-        _local_state: Option<&mut Self::LocalState>,
         context: &Context,
-        mut output: DataChunkRef<'_>,
+        bind_data: &Self::BindData,
+        _local_state: Option<&mut Self::LocalState>,
+        global_state: Option<&Self::GlobalState>,
+        output: &mut DataChunk<'_>,
         _column_info: ExecColumnInfo<'_>,
     ) -> Result<()> {
         let global_state = global_state
@@ -142,40 +149,45 @@ impl TableFunctionCallbacks for BackupsFunction {
             ($index:expr, $ty:ty, $value:expr) => {{
                 let mut vector = output.get_vector_at_mut::<$ty>($index)?;
                 vector.set_size(1)?;
-                vector.writer()?.set(0, $value)?;
+                vector.writer()?.set_option(0, $value)?;
             }};
         }
+
+        let write_string_list =
+            |output: &mut DataChunk<'_>, index: usize, values: Option<&Vec<String>>| -> Result<()> {
+                let mut vector = output.get_vector_at_mut::<List<String>>(index)?;
+                vector.set_size(1)?;
+                match values {
+                    Some(names) => {
+                        vector.set_child_size(names.len())?;
+                        vector
+                            .list_writer()?
+                            .set_elements(0, names.iter().map(|name| Some(name.as_str())))?;
+                    }
+                    None => {
+                        vector.set_child_size(0)?;
+                        vector.list_writer()?.set_null(0)?;
+                    }
+                }
+                Ok(())
+            };
 
         write_column!(0, String, Some(dir));
         write_column!(1, String, row.name.as_deref());
         write_column!(2, String, row.id.as_deref());
         write_column!(3, String, row.milvus_version.as_deref());
         write_column!(4, String, Some(row.format.as_str()));
-        write_column!(5, TimestampTzValue, row.created_at);
-        write_column!(6, u64, row.backup_timestamp);
-        write_column!(7, i64, row.size_bytes);
-        write_column!(
-            8,
-            List<String>,
-            row.databases.as_ref().map(|names| names
-                .iter()
-                .map(|name| Some(name.as_str()))
-                .collect::<Vec<Option<&str>>>())
-        );
-        write_column!(
-            9,
-            List<String>,
-            row.collection_names.as_ref().map(|names| names
-                .iter()
-                .map(|name| Some(name.as_str()))
-                .collect::<Vec<Option<&str>>>())
-        );
-        write_column!(10, i64, row.collection_count);
-        write_column!(11, i64, row.partition_count);
-        write_column!(12, i64, row.segment_count);
-        write_column!(13, i64, row.num_rows_inserted);
-        write_column!(14, bool, row.has_delete_logs);
-        write_column!(15, bool, row.has_rbac);
+        write_column!(5, TimestampTzValue, row.created_at.as_ref());
+        write_column!(6, u64, row.backup_timestamp.as_ref());
+        write_column!(7, i64, row.size_bytes.as_ref());
+        write_string_list(output, 8, row.databases.as_ref())?;
+        write_string_list(output, 9, row.collection_names.as_ref())?;
+        write_column!(10, i64, row.collection_count.as_ref());
+        write_column!(11, i64, row.partition_count.as_ref());
+        write_column!(12, i64, row.segment_count.as_ref());
+        write_column!(13, i64, row.num_rows_inserted.as_ref());
+        write_column!(14, bool, row.has_delete_logs.as_ref());
+        write_column!(15, bool, row.has_rbac.as_ref());
 
         Ok(())
     }
