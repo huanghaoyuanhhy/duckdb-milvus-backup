@@ -1,4 +1,4 @@
-.PHONY: clean clean_all
+.PHONY: clean clean_all mingw_libgcc_eh_stub
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -22,11 +22,28 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 IS_EXAMPLE=
 ifneq ($(DUCKDB_WASM_PLATFORM),)
 	TARGET_INFO=--target $(TARGET) --package milvus_backup_wasm
+	# Side modules (-sSIDE_MODULE=2) require PIC object files; cc-rs omits
+	# -fPIC on wasm32 by default, which breaks linking C deps like zstd-sys.
+	export CFLAGS_wasm32_unknown_emscripten ?= -fPIC
+else ifneq ($(filter windows_amd64_mingw windows_amd64_rtools,$(DUCKDB_PLATFORM)),)
+	# CI installs the GNU Rust target and sets CC=gcc for MinGW, but
+	# rust.Makefile leaves TARGET unset so Cargo defaults to MSVC and fails
+	# linking MinGW-compiled C deps (zstd-sys) under link.exe.
+	# Rtools' static MinGW toolchain folds unwind symbols into libgcc.a and
+	# omits a separate libgcc_eh.a, so provide an empty stub archive when absent.
+	TARGET=x86_64-pc-windows-gnu
+	TARGET_INFO=--target $(TARGET) --package milvus_backup
+	TARGET_PATH=./target/$(TARGET)
+	export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS ?= -Lnative=build/mingw-stub
+build_extension_library_debug build_extension_library_release: mingw_libgcc_eh_stub
 else
 	TARGET_INFO+=--package milvus_backup
 endif
 
 configure: venv platform extension_version
+
+mingw_libgcc_eh_stub: check_configure
+	$(PYTHON_VENV_BIN) -c "import subprocess; from pathlib import Path; p = Path('build/mingw-stub'); p.mkdir(parents=True, exist_ok=True); stub = p / 'libgcc_eh.a'; out = subprocess.check_output(['x86_64-w64-mingw32-gcc', '-print-file-name=libgcc_eh.a'], text=True).strip(); stub.write_bytes(b'!<arch>' + bytes([10])) if out == 'libgcc_eh.a' else stub.unlink(missing_ok=True)"
 
 debug: build_extension_library_debug build_extension_with_metadata_debug
 release: build_extension_library_release build_extension_with_metadata_release
